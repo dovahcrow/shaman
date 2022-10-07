@@ -32,14 +32,14 @@ const SERVER: Token = Token(0);
 const WAKER: Token = Token(1);
 
 pub trait RequestHandler {
-    fn handle(&mut self, conn_id: usize, req: Request, handle: &ShamanServerHandle);
+    fn handle(&mut self, conn_id: ConnId, req: Request, handle: &ShamanServerHandle);
 }
 
 impl<T> RequestHandler for T
 where
-    T: FnMut(usize, Request, &ShamanServerHandle),
+    T: FnMut(ConnId, Request, &ShamanServerHandle),
 {
-    fn handle(&mut self, conn_id: usize, req: Request, handle: &ShamanServerHandle) {
+    fn handle(&mut self, conn_id: ConnId, req: Request, handle: &ShamanServerHandle) {
         self(conn_id, req, handle)
     }
 }
@@ -61,7 +61,7 @@ pub struct ShamanServer<H> {
     // communication with outside
     poll: Poll,
     queue: Arc<NotificationQueue>, // Notification queue for resp_rx
-    resp_rx: StdReceiver<(Option<usize>, Response)>, // None if broadcast
+    resp_rx: StdReceiver<(Option<ConnId>, Response)>, // None if broadcast
     request_handler: H,
 
     handle: ShamanServerHandle,
@@ -70,7 +70,7 @@ pub struct ShamanServer<H> {
 #[derive(Clone)]
 pub struct ShamanServerHandle {
     exit: Arc<AtomicBool>,
-    pub tx: MSender<(Option<usize>, Response)>,
+    pub tx: MSender<(Option<ConnId>, Response)>,
 }
 
 impl ShamanServerHandle {
@@ -84,8 +84,8 @@ impl ShamanServerHandle {
 
     pub fn send(
         &self,
-        t: (Option<usize>, Response),
-    ) -> Result<(), SendError<(Option<usize>, Response)>> {
+        t: (Option<ConnId>, Response),
+    ) -> Result<(), SendError<(Option<ConnId>, Response)>> {
         self.tx.send(t)
     }
 }

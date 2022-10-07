@@ -13,3 +13,5 @@ pub enum Response {
     Error { id: u64, code: u64 },
     Subscription { channel: String, data: Vec<u8> },
 }
+
+pub type ConnId = usize;
