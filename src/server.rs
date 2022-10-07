@@ -20,6 +20,7 @@ use std::{
     os::unix::io::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{channel as stdchannel, Receiver as StdReceiver, Sender as StdSender},
         Arc,
     },
@@ -48,17 +49,26 @@ pub struct ShamanServer {
     queue: Arc<NotificationQueue>, // Notification queue for resp_rx
     req_tx: StdSender<(usize, Request)>,
     resp_rx: StdReceiver<(Option<usize>, Response)>, // None if broadcast
+
+    // control
+    exit: Arc<AtomicBool>,
+}
+
+pub struct ShamanServerHandle {
+    exit: Arc<AtomicBool>,
+    pub tx: MSender<(Option<usize>, Response)>,
+    pub rx: StdReceiver<(usize, Request)>,
+}
+
+impl ShamanServerHandle {
+    pub fn exit(self) {
+        self.exit.store(true, Ordering::Relaxed);
+    }
 }
 
 impl ShamanServer {
     #[throws(ShamanError)]
-    pub fn new<P>(
-        path: P,
-    ) -> (
-        Self,
-        MSender<(Option<usize>, Response)>,
-        StdReceiver<(usize, Request)>,
-    )
+    pub fn new<P>(path: P) -> (Self, ShamanServerHandle)
     where
         P: AsRef<Path>,
     {
@@ -77,6 +87,7 @@ impl ShamanServer {
         poll.registry()
             .register(&mut listener, SERVER, Interest::READABLE)?;
 
+        let exit = Arc::new(AtomicBool::new(false));
         (
             Self {
                 socket_path: path.to_owned(),
@@ -89,9 +100,14 @@ impl ShamanServer {
                 queue,
                 req_tx,  // id: 1
                 resp_rx, // id: 2
+
+                exit: exit.clone(),
             },
-            resp_tx,
-            req_rx,
+            ShamanServerHandle {
+                tx: resp_tx,
+                rx: req_rx,
+                exit: exit.clone(),
+            },
         )
     }
 
@@ -107,7 +123,7 @@ impl ShamanServer {
     pub fn start(mut self) {
         let mut events = Events::with_capacity(128);
 
-        loop {
+        while !self.exit.load(Ordering::Relaxed) {
             self.poll
                 .poll(&mut events, Some(Duration::from_millis(100)))?;
 
@@ -178,19 +194,16 @@ impl ShamanServer {
                     let rawfd = stream.as_raw_fd();
                     let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
                     if let Err(e) =
-                        stdstream.send_with_fd(&CAPACITY.to_le_bytes(), &[mr, er, fr, ms, es, fs])
+                        stdstream.send_with_fd(&CAPACITY.to_ne_bytes(), &[mr, er, fr, ms, es, fs])
                     {
                         error!("Cannot send fds: {}", e);
                         continue;
                     };
                     forget(stdstream);
 
-                    let id = Token(self.next_poll_token);
-                    self.next_poll_token += 1;
-                    let tx_token = Token(self.next_poll_token);
-                    self.next_poll_token += 1;
-                    let rx_token = Token(self.next_poll_token);
-                    self.next_poll_token += 1;
+                    let id = self.next_token();
+                    let tx_token = self.next_token();
+                    let rx_token = self.next_token();
 
                     self.connections.insert(
                         id,
@@ -241,9 +254,8 @@ impl ShamanServer {
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
-            conn.duplex.recv()?;
 
-            while let Some(data) = conn.duplex.decode()? {
+            while let Some(data) = conn.duplex.recv()? {
                 let req: Request = bincode::deserialize(&data[SIZE..])?;
                 if let Err(_) = self.req_tx.send((conn_id.0, req)) {
                     error!("Cannot send req")
@@ -275,6 +287,12 @@ impl ShamanServer {
         }
 
         error!("Unhandled event: {:?}", event);
+    }
+
+    fn next_token(&mut self) -> Token {
+        let token = Token(self.next_poll_token);
+        self.next_poll_token += 1;
+        token
     }
 }
 

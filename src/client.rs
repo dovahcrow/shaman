@@ -30,7 +30,7 @@ impl ShamanClient {
             panic!("Cannot recv fds: {}", e);
         };
 
-        let len = usize::from_le_bytes(len);
+        let len = usize::from_ne_bytes(len);
         let tx = unsafe {
             IPCSender::open(
                 len,
@@ -58,9 +58,7 @@ impl ShamanClient {
     pub fn recv(&mut self) -> Option<Response> {
         self.duplex.rx.block_until_readable()?;
 
-        self.duplex.recv()?;
-
-        match self.duplex.decode()? {
+        match self.duplex.recv()? {
             None => None,
             Some(data) => {
                 let resp: Response = bincode::deserialize(&data[SIZE..])?;

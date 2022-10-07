@@ -13,13 +13,13 @@ use shaman::{Response, ShamanServer};
 fn main() {
     env_logger::init();
     let _ = remove_file("/tmp/shaman.sock");
-    let (s, tx, rx) = ShamanServer::new("/tmp/shaman.sock")?;
+    let (server, handle) = ShamanServer::new("/tmp/shaman.sock")?;
 
-    s.spawn();
+    server.spawn();
 
     loop {
-        if let Ok((conn_id, req)) = rx.try_recv() {
-            tx.send((
+        if let Ok((conn_id, req)) = handle.rx.try_recv() {
+            handle.tx.send((
                 Some(conn_id),
                 Response::Success {
                     id: req.id,
@@ -30,7 +30,7 @@ fn main() {
 
         let now = Instant::now();
         let data = format!("{:?}", now).as_bytes().to_vec();
-        tx.send((
+        handle.tx.send((
             None,
             Response::Subscription {
                 channel: "Time".into(),

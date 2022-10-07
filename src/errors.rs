@@ -5,6 +5,9 @@ pub enum ShamanError {
     #[error("Bytes too short, expected {0}, got {1}")]
     BytesTooShort(usize, usize),
 
+    #[error("The sender is full")]
+    SenderFull,
+
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 
