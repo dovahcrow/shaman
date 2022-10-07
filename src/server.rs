@@ -6,7 +6,7 @@ use mio::{
     Token, Waker,
 };
 use mio_misc::{
-    channel::{channel as mchannel, Sender as MSender},
+    channel::{channel as mchannel, SendError, Sender as MSender},
     queue::NotificationQueue,
     NotificationId,
 };
@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{channel as stdchannel, Receiver as StdReceiver, Sender as StdSender},
+        mpsc::Receiver as StdReceiver,
         Arc,
     },
     thread::spawn,
@@ -31,11 +31,25 @@ use std::{
 const SERVER: Token = Token(0);
 const WAKER: Token = Token(1);
 
+pub trait RequestHandler {
+    fn handle(&mut self, conn_id: usize, req: Request, handle: &ShamanServerHandle);
+}
+
+impl<T> RequestHandler for T
+where
+    T: FnMut(usize, Request, &ShamanServerHandle),
+{
+    fn handle(&mut self, conn_id: usize, req: Request, handle: &ShamanServerHandle) {
+        self(conn_id, req, handle)
+    }
+}
+
 pub struct Connection {
     pub(crate) stream: UnixStream,
     duplex: Duplex,
 }
-pub struct ShamanServer {
+
+pub struct ShamanServer<H> {
     socket_path: PathBuf,
     socket_listener: UnixListener,
     connections: HashMap<Token, Connection>, // connection id -> connection
@@ -47,28 +61,53 @@ pub struct ShamanServer {
     // communication with outside
     poll: Poll,
     queue: Arc<NotificationQueue>, // Notification queue for resp_rx
-    req_tx: StdSender<(usize, Request)>,
     resp_rx: StdReceiver<(Option<usize>, Response)>, // None if broadcast
+    request_handler: H,
 
-    // control
-    exit: Arc<AtomicBool>,
+    handle: ShamanServerHandle,
 }
 
+#[derive(Clone)]
 pub struct ShamanServerHandle {
     exit: Arc<AtomicBool>,
     pub tx: MSender<(Option<usize>, Response)>,
-    pub rx: StdReceiver<(usize, Request)>,
 }
 
 impl ShamanServerHandle {
-    pub fn exit(self) {
+    pub fn is_exited(&self) -> bool {
+        self.exit.load(Ordering::Relaxed)
+    }
+
+    pub fn exit(&self) {
         self.exit.store(true, Ordering::Relaxed);
+    }
+
+    pub fn send(
+        &self,
+        t: (Option<usize>, Response),
+    ) -> Result<(), SendError<(Option<usize>, Response)>> {
+        self.tx.send(t)
     }
 }
 
-impl ShamanServer {
+impl<H> ShamanServer<H>
+where
+    H: RequestHandler + Send + 'static,
+{
+    pub fn spawn(self) {
+        spawn(move || match self.start() {
+            Err(e) => error!("ShamanServer exited due to: {:?}", e),
+            Ok(_) => {}
+        });
+    }
+}
+
+impl<H> ShamanServer<H>
+where
+    H: RequestHandler,
+{
     #[throws(ShamanError)]
-    pub fn new<P>(path: P) -> (Self, ShamanServerHandle)
+    pub fn new<P>(path: P, req_handler: H) -> (Self, ShamanServerHandle)
     where
         P: AsRef<Path>,
     {
@@ -79,15 +118,16 @@ impl ShamanServer {
 
         let poll = Poll::new()?;
 
-        let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
-        let queue = Arc::new(NotificationQueue::new(waker));
-        let (req_tx, req_rx) = stdchannel();
-        let (resp_tx, resp_rx) = mchannel(queue.clone(), NotificationId::gen_next());
-
         poll.registry()
             .register(&mut listener, SERVER, Interest::READABLE)?;
 
+        let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        let queue = Arc::new(NotificationQueue::new(waker));
+        let (resp_tx, resp_rx) = mchannel(queue.clone(), NotificationId::gen_next());
+
         let exit = Arc::new(AtomicBool::new(false));
+        let handle = ShamanServerHandle { tx: resp_tx, exit };
+
         (
             Self {
                 socket_path: path.to_owned(),
@@ -98,24 +138,12 @@ impl ShamanServer {
                 tx_token_to_connection: HashMap::new(),
                 poll,
                 queue,
-                req_tx,  // id: 1
-                resp_rx, // id: 2
-
-                exit: exit.clone(),
+                resp_rx,
+                request_handler: req_handler,
+                handle: handle.clone(),
             },
-            ShamanServerHandle {
-                tx: resp_tx,
-                rx: req_rx,
-                exit: exit.clone(),
-            },
+            handle,
         )
-    }
-
-    pub fn spawn(self) {
-        spawn(move || match self.start() {
-            Err(e) => error!("ShamanServer exited due to: {:?}", e),
-            Ok(_) => {}
-        });
     }
 
     #[allow(unreachable_code)]
@@ -123,7 +151,7 @@ impl ShamanServer {
     pub fn start(mut self) {
         let mut events = Events::with_capacity(128);
 
-        while !self.exit.load(Ordering::Relaxed) {
+        while !self.handle.is_exited() {
             self.poll
                 .poll(&mut events, Some(Duration::from_millis(100)))?;
 
@@ -156,7 +184,7 @@ impl ShamanServer {
                         }
                     }
                     WAKER => self.response_handler()?,
-                    _ => self.request_handler(event)?,
+                    _ => self.ipc_handler(event)?,
                 }
             }
         }
@@ -245,7 +273,7 @@ impl ShamanServer {
     }
 
     #[throws(ShamanError)]
-    fn request_handler(&mut self, event: &Event) {
+    fn ipc_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
             conn.duplex.flush()?;
@@ -257,9 +285,7 @@ impl ShamanServer {
 
             while let Some(data) = conn.duplex.recv()? {
                 let req: Request = bincode::deserialize(&data[SIZE..])?;
-                if let Err(_) = self.req_tx.send((conn_id.0, req)) {
-                    error!("Cannot send req")
-                };
+                self.request_handler.handle(conn_id.0, req, &self.handle);
             }
             return;
         }
@@ -296,7 +322,7 @@ impl ShamanServer {
     }
 }
 
-impl Drop for ShamanServer {
+impl<H> Drop for ShamanServer<H> {
     fn drop(&mut self) {
         let _ = remove_file(&self.socket_path);
     }
