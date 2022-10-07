@@ -1,7 +1,10 @@
-use crate::{connection::Connection, errors::ShamanError, types::*, CAPACITY, SIZE};
+use crate::{duplex::Duplex, errors::ShamanError, types::*, CAPACITY, SIZE};
 use fehler::{throw, throws};
 use log::{error, info};
-use mio::{event::Event, net::UnixListener, unix::SourceFd, Events, Interest, Poll, Token, Waker};
+use mio::{
+    event::Event, net::UnixListener, net::UnixStream, unix::SourceFd, Events, Interest, Poll,
+    Token, Waker,
+};
 use mio_misc::{
     channel::{channel as mchannel, Sender as MSender},
     queue::NotificationQueue,
@@ -20,12 +23,17 @@ use std::{
         mpsc::{channel as stdchannel, Receiver as StdReceiver, Sender as StdSender},
         Arc,
     },
+    thread::spawn,
     time::Duration,
 };
 
 const SERVER: Token = Token(0);
 const WAKER: Token = Token(1);
 
+pub struct Connection {
+    pub(crate) stream: UnixStream,
+    duplex: Duplex,
+}
 pub struct ShamanServer {
     socket_path: PathBuf,
     socket_listener: UnixListener,
@@ -87,6 +95,13 @@ impl ShamanServer {
         )
     }
 
+    pub fn spawn(self) {
+        spawn(move || match self.start() {
+            Err(e) => error!("ShamanServer exited due to: {:?}", e),
+            Ok(_) => {}
+        });
+    }
+
     #[allow(unreachable_code)]
     #[throws(ShamanError)]
     pub fn start(mut self) {
@@ -110,18 +125,18 @@ impl ShamanServer {
                             )?;
 
                             self.poll.registry().register(
-                                &mut SourceFd(&conn.tx.full_signal().as_raw_fd()),
+                                &mut SourceFd(&conn.duplex.tx.full_signal().as_raw_fd()),
                                 tx_token,
                                 Interest::READABLE,
                             )?;
 
                             self.poll.registry().register(
-                                &mut SourceFd(&conn.rx.empty_signal().as_raw_fd()),
+                                &mut SourceFd(&conn.duplex.rx.empty_signal().as_raw_fd()),
                                 rx_token,
                                 Interest::READABLE,
                             )?;
 
-                            info!("Registered {}", id.0);
+                            info!("Registered new connection {}", id.0);
                         }
                     }
                     WAKER => self.response_handler()?,
@@ -137,8 +152,7 @@ impl ShamanServer {
 
         loop {
             match self.socket_listener.accept() {
-                Ok((stream, addr)) => {
-                    info!("New connection from {:?}", addr);
+                Ok((stream, _)) => {
                     let rx = match IPCReceiver::new(CAPACITY as usize) {
                         Ok(r) => r,
                         Err(e) => {
@@ -178,7 +192,13 @@ impl ShamanServer {
                     let rx_token = Token(self.next_poll_token);
                     self.next_poll_token += 1;
 
-                    self.connections.insert(id, Connection::new(stream, tx, rx));
+                    self.connections.insert(
+                        id,
+                        Connection {
+                            stream,
+                            duplex: Duplex::new(tx, rx),
+                        },
+                    );
                     self.tx_token_to_connection.insert(tx_token, id);
                     self.rx_token_to_connection.insert(rx_token, id);
                     new_conns.push((id, tx_token, rx_token));
@@ -200,11 +220,11 @@ impl ShamanServer {
             match id {
                 Some(id) => {
                     let connection = self.connections.get_mut(&Token(id)).unwrap();
-                    connection.send(&smsg)?;
+                    connection.duplex.send(&smsg)?;
                 }
                 None => {
                     for connection in self.connections.values_mut() {
-                        connection.send(&smsg)?;
+                        connection.duplex.send(&smsg)?;
                     }
                 }
             }
@@ -215,15 +235,15 @@ impl ShamanServer {
     fn request_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
-            conn.flush()?;
+            conn.duplex.flush()?;
             return;
         }
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
-            conn.recv()?;
+            conn.duplex.recv()?;
 
-            if let Some(data) = conn.decode()? {
+            while let Some(data) = conn.duplex.decode()? {
                 let req: Request = bincode::deserialize(&data[SIZE..])?;
                 if let Err(_) = self.req_tx.send((conn_id.0, req)) {
                     error!("Cannot send req")
@@ -240,11 +260,11 @@ impl ShamanServer {
 
                     self.poll
                         .registry()
-                        .deregister(&mut SourceFd(&conn.tx.full_signal().as_raw_fd()))?;
+                        .deregister(&mut SourceFd(&conn.duplex.tx.full_signal().as_raw_fd()))?;
 
                     self.poll
                         .registry()
-                        .deregister(&mut SourceFd(&conn.rx.empty_signal().as_raw_fd()))?;
+                        .deregister(&mut SourceFd(&conn.duplex.rx.empty_signal().as_raw_fd()))?;
                 }
                 None => {
                     error!("Connection {} not found", event.token().0)

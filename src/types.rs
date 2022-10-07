@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 pub struct Request {
-    id: u64,
-    method: String,
-    params: Vec<u8>,
+    pub id: u64,
+    pub method: String,
+    pub params: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize)]

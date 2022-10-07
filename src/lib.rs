@@ -1,5 +1,5 @@
 mod client;
-mod connection;
+mod duplex;
 mod errors;
 mod server;
 mod types;

@@ -1,21 +1,18 @@
 use crate::{errors::ShamanError, SIZE};
 use fehler::throws;
-use mio::net::UnixStream;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::{collections::VecDeque, io::Read, mem::swap};
+use std::{collections::VecDeque, mem::swap};
 
-pub struct Connection {
-    pub(crate) stream: UnixStream,
+pub struct Duplex {
     pub(crate) tx: IPCSender<u8>,
     pub(crate) rx: IPCReceiver<u8>,
     tx_buf: VecDeque<u8>,
     rx_buf: VecDeque<u8>,
 }
 
-impl Connection {
-    pub fn new(stream: UnixStream, tx: IPCSender<u8>, rx: IPCReceiver<u8>) -> Self {
-        Connection {
-            stream,
+impl Duplex {
+    pub fn new(tx: IPCSender<u8>, rx: IPCReceiver<u8>) -> Self {
+        Duplex {
             tx,
             rx,
             tx_buf: VecDeque::new(),
@@ -45,7 +42,7 @@ impl Connection {
                 buf = &mut buf[n..];
 
                 if !buf.is_empty() {
-                    let len_data = data.len().to_le_bytes();
+                    let len_data = data.len().to_ne_bytes();
                     let n = write_slice(buf, &len_data);
                     buf = &mut buf[n..];
 
@@ -87,14 +84,17 @@ impl Connection {
             return None;
         }
         let mut n = [0; SIZE];
-        self.rx_buf.read_exact(&mut n)?;
-        let n = usize::from_le_bytes(n);
+        let mut iter = self.rx_buf.iter();
+        for i in 0..SIZE {
+            n[i] = *iter.next().unwrap();
+        }
+        let n = usize::from_ne_bytes(n);
 
-        if self.rx_buf.len() < n {
+        if self.rx_buf.len() < n + SIZE {
             return None;
         }
 
-        let mut buf = self.rx_buf.split_off(n);
+        let mut buf = self.rx_buf.split_off(n + SIZE);
         swap(&mut buf, &mut self.rx_buf);
         Some(Vec::from_iter(buf))
     }

@@ -1,7 +1,10 @@
+use crate::duplex::Duplex;
 use crate::{errors::ShamanError, SIZE};
+use crate::{Request, Response};
 use fehler::throws;
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
+use std::os::unix::net::UnixStream;
 use std::{
     fs::File,
     os::unix::{io::FromRawFd, prelude::RawFd},
@@ -9,9 +12,8 @@ use std::{
 };
 
 pub struct ShamanClient {
-    stream: std::os::unix::net::UnixStream,
-    tx: IPCSender<u8>,
-    rx: IPCReceiver<u8>,
+    _stream: UnixStream,
+    duplex: Duplex,
 }
 
 impl ShamanClient {
@@ -46,6 +48,35 @@ impl ShamanClient {
             )?
         };
 
-        Self { stream, tx, rx }
+        Self {
+            _stream: stream,
+            duplex: Duplex::new(tx, rx),
+        }
+    }
+
+    #[throws(ShamanError)]
+    pub fn recv(&mut self) -> Option<Response> {
+        self.duplex.rx.block_until_readable()?;
+
+        self.duplex.recv()?;
+
+        match self.duplex.decode()? {
+            None => None,
+            Some(data) => {
+                let resp: Response = bincode::deserialize(&data[SIZE..])?;
+                Some(resp)
+            }
+        }
+    }
+
+    #[throws(ShamanError)]
+    pub fn send(&mut self, id: u64, method: &str, params: &[u8]) {
+        let req = Request {
+            id,
+            method: method.into(),
+            params: params.into(),
+        };
+        let serialized = bincode::serialize(&req)?;
+        self.duplex.send(&serialized)?;
     }
 }
