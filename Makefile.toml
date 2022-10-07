@@ -1,0 +1,10 @@
+[config]
+default_to_workspace = false
+
+[env]
+RUST_BACKTRACE = "1"
+RUST_LOG = "shaman=info"
+
+[tasks.run]
+args = ["run", "${@}"]
+command = "cargo"

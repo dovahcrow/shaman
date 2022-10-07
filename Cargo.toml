@@ -1,0 +1,22 @@
+[package]
+edition = "2021"
+name = "shaman"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bincode = "1"
+fehler = "1"
+log = "0.4.17"
+mio = {version = "0.8", features = ["net", "os-ext"]}
+mio-misc = "2"
+parking_lot = "0.12"
+sendfd = "0.4.3"
+serde = {version = "1", features = ["derive"]}
+shmem-ipc = "0.2"
+thiserror = "1"
+
+[dev-dependencies]
+anyhow = "1"
+env_logger = "0.9"
