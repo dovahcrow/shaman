@@ -13,7 +13,4 @@ pub enum ShamanError {
 
     #[error(transparent)]
     IPCError(#[from] shmem_ipc::Error),
-
-    #[error(transparent)]
-    BincodeError(#[from] Box<bincode::ErrorKind>),
 }

@@ -93,7 +93,7 @@ impl Duplex {
             return None;
         }
 
-        Some(self.rx_buf.drain(..n + SIZE).collect())
+        Some(self.rx_buf.drain(..n + SIZE).skip(SIZE).collect())
     }
 }
 

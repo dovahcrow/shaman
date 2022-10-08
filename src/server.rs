@@ -1,4 +1,4 @@
-use crate::{duplex::Duplex, errors::ShamanError, types::*, CAPACITY, SIZE};
+use crate::{duplex::Duplex, errors::ShamanError, types::*};
 use fehler::{throw, throws};
 use log::{error, info};
 use mio::{
@@ -15,7 +15,7 @@ use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
 use std::{
     collections::HashMap,
     fs::remove_file,
-    io::{self},
+    io,
     mem::forget,
     os::unix::io::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
@@ -32,15 +32,15 @@ const SERVER: Token = Token(0);
 const WAKER: Token = Token(1);
 
 pub trait RequestHandler {
-    fn handle(&mut self, conn_id: ConnId, req: Request, handle: &ShamanServerHandle);
+    fn handle(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle);
 }
 
 impl<T> RequestHandler for T
 where
-    T: FnMut(ConnId, Request, &ShamanServerHandle),
+    T: FnMut(ConnId, Vec<u8>, &ShamanServerHandle),
 {
-    fn handle(&mut self, conn_id: ConnId, req: Request, handle: &ShamanServerHandle) {
-        self(conn_id, req, handle)
+    fn handle(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle) {
+        self(conn_id, data, handle)
     }
 }
 
@@ -51,6 +51,7 @@ pub struct Connection {
 
 pub struct ShamanServer<H> {
     socket_path: PathBuf,
+    capacity: usize,
     socket_listener: UnixListener,
     connections: HashMap<Token, Connection>, // connection id -> connection
     tx_token_to_connection: HashMap<Token, Token>, // tx poll token -> connection id
@@ -61,7 +62,7 @@ pub struct ShamanServer<H> {
     // communication with outside
     poll: Poll,
     queue: Arc<NotificationQueue>, // Notification queue for resp_rx
-    resp_rx: StdReceiver<(Option<ConnId>, Response)>, // None if broadcast
+    resp_rx: StdReceiver<(Option<ConnId>, Vec<u8>)>, // None if broadcast
     request_handler: H,
 
     handle: ShamanServerHandle,
@@ -70,7 +71,7 @@ pub struct ShamanServer<H> {
 #[derive(Clone)]
 pub struct ShamanServerHandle {
     exit: Arc<AtomicBool>,
-    pub tx: MSender<(Option<ConnId>, Response)>,
+    pub tx: MSender<(Option<ConnId>, Vec<u8>)>,
 }
 
 impl ShamanServerHandle {
@@ -84,8 +85,8 @@ impl ShamanServerHandle {
 
     pub fn send(
         &self,
-        t: (Option<ConnId>, Response),
-    ) -> Result<(), SendError<(Option<ConnId>, Response)>> {
+        t: (Option<ConnId>, Vec<u8>),
+    ) -> Result<(), SendError<(Option<ConnId>, Vec<u8>)>> {
         self.tx.send(t)
     }
 }
@@ -107,7 +108,7 @@ where
     H: RequestHandler,
 {
     #[throws(ShamanError)]
-    pub fn new<P>(path: P, req_handler: H) -> (Self, ShamanServerHandle)
+    pub fn new<P>(path: P, capacity: usize, req_handler: H) -> (Self, ShamanServerHandle)
     where
         P: AsRef<Path>,
     {
@@ -131,6 +132,7 @@ where
         (
             Self {
                 socket_path: path.to_owned(),
+                capacity,
                 socket_listener: listener,
                 connections,
                 next_poll_token: 2,
@@ -197,7 +199,7 @@ where
         loop {
             match self.socket_listener.accept() {
                 Ok((stream, _)) => {
-                    let rx = match IPCReceiver::new(CAPACITY as usize) {
+                    let rx = match IPCReceiver::new(self.capacity) {
                         Ok(r) => r,
                         Err(e) => {
                             error!("Cannot create receiver: {}", e);
@@ -208,7 +210,7 @@ where
                     let er = rx.empty_signal().as_raw_fd();
                     let fr = rx.full_signal().as_raw_fd();
 
-                    let tx = match IPCSender::new(CAPACITY as usize) {
+                    let tx = match IPCSender::new(self.capacity) {
                         Ok(r) => r,
                         Err(e) => {
                             error!("Cannot create sender: {}", e);
@@ -221,8 +223,8 @@ where
 
                     let rawfd = stream.as_raw_fd();
                     let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
-                    if let Err(e) =
-                        stdstream.send_with_fd(&CAPACITY.to_ne_bytes(), &[mr, er, fr, ms, es, fs])
+                    if let Err(e) = stdstream
+                        .send_with_fd(&self.capacity.to_ne_bytes(), &[mr, er, fr, ms, es, fs])
                     {
                         error!("Cannot send fds: {}", e);
                         continue;
@@ -257,15 +259,14 @@ where
         while let Some(_) = self.queue.pop() {
             let (id, message) = self.resp_rx.recv().unwrap();
 
-            let smsg = bincode::serialize(&message)?;
             match id {
                 Some(id) => {
                     let connection = self.connections.get_mut(&Token(id)).unwrap();
-                    connection.duplex.send(&smsg)?;
+                    connection.duplex.send(&message)?;
                 }
                 None => {
                     for connection in self.connections.values_mut() {
-                        connection.duplex.send(&smsg)?;
+                        connection.duplex.send(&message)?;
                     }
                 }
             }
@@ -284,8 +285,7 @@ where
             let conn = self.connections.get_mut(conn_id).unwrap();
 
             while let Some(data) = conn.duplex.recv()? {
-                let req: Request = bincode::deserialize(&data[SIZE..])?;
-                self.request_handler.handle(conn_id.0, req, &self.handle);
+                self.request_handler.handle(conn_id.0, data, &self.handle);
             }
             return;
         }
