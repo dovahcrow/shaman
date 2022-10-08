@@ -33,15 +33,15 @@ const WAKER: Token = Token(1);
 
 pub trait MessageHandler {
     fn on_connect(&mut self, _: ConnId, _: &ShamanServerHandle) {}
-    fn on_data(&mut self, _: ConnId, _: Vec<u8>, _: &ShamanServerHandle) {}
+    fn on_data(&mut self, _: ConnId, _: &[u8], _: &ShamanServerHandle) {}
     fn on_disconnect(&mut self, _: ConnId) {}
 }
 
 impl<T> MessageHandler for T
 where
-    T: FnMut(ConnId, Vec<u8>, &ShamanServerHandle),
+    T: FnMut(ConnId, &[u8], &ShamanServerHandle),
 {
-    fn on_data(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle) {
+    fn on_data(&mut self, conn_id: ConnId, data: &[u8], handle: &ShamanServerHandle) {
         self(conn_id, data, handle)
     }
 }
@@ -260,16 +260,31 @@ where
     #[throws(ShamanError)]
     fn response_handler(&mut self) {
         while let Some(_) = self.queue.pop() {
-            let (id, message) = self.resp_rx.recv().unwrap();
-
-            match id {
-                Some(id) => {
-                    let connection = self.connections.get_mut(&Token(id)).unwrap();
-                    connection.duplex.send(&message)?;
-                }
-                None => {
-                    for connection in self.connections.values_mut() {
-                        connection.duplex.send(&message)?;
+            while let Ok((id, message)) = self.resp_rx.try_recv() {
+                match id {
+                    Some(id) => {
+                        let connection = match self.connections.get_mut(&Token(id)) {
+                            Some(conn) => conn,
+                            None => continue,
+                        };
+                        match connection.duplex.send(&message) {
+                            Ok(_) => {}
+                            Err(ShamanError::SenderFull) => {
+                                error!("Sender for connection {} is full, drop message", id);
+                            }
+                            Err(e) => throw!(e),
+                        };
+                    }
+                    None => {
+                        for (id, connection) in &mut self.connections {
+                            match connection.duplex.send(&message) {
+                                Ok(_) => {}
+                                Err(ShamanError::SenderFull) => {
+                                    error!("Sender for connection {} is full, drop message", id.0);
+                                }
+                                Err(e) => throw!(e),
+                            };
+                        }
                     }
                 }
             }
@@ -287,8 +302,10 @@ where
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
 
-            while let Some(data) = conn.duplex.recv()? {
-                self.message_handler.on_data(conn_id.0, data, &self.handle);
+            while let Some(_) = conn
+                .duplex
+                .try_recv_with(|data| self.message_handler.on_data(conn_id.0, data, &self.handle))?
+            {
             }
             return;
         }

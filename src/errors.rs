@@ -8,6 +8,12 @@ pub enum ShamanError {
     #[error("The sender is full")]
     SenderFull,
 
+    #[error("Connection timeout")]
+    ConnectionTimeout,
+
+    #[error("Connection closed")]
+    ConnectionClosed,
+
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 

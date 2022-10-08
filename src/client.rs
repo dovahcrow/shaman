@@ -1,19 +1,34 @@
 use crate::duplex::Duplex;
-use crate::{errors::ShamanError, SIZE};
-use fehler::throws;
+use crate::{
+    errors::ShamanError::{self, *},
+    SIZE,
+};
+use fehler::{throw, throws};
+use mio::net::UnixStream;
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token};
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::os::unix::net::UnixStream;
+use std::mem::forget;
 use std::os::unix::prelude::AsRawFd;
+use std::time::Duration;
 use std::{
     fs::File,
     os::unix::{io::FromRawFd, prelude::RawFd},
     path::Path,
 };
 
+const SOCK: Token = Token(0);
+const TX: Token = Token(1);
+const RX: Token = Token(2);
+
 pub struct ShamanClient {
     _stream: UnixStream,
     duplex: Duplex,
+    poll: Poll,
+    sendable: bool,
+    receivable: bool,
+    events: Events,
 }
 
 impl ShamanClient {
@@ -22,13 +37,27 @@ impl ShamanClient {
     where
         P: AsRef<Path>,
     {
-        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        let mut stream = UnixStream::connect(path)?;
+
+        let mut poll = Poll::new()?;
+        let mut events = Events::with_capacity(128);
+        poll.registry()
+            .register(&mut stream, SOCK, Interest::READABLE)?;
+        poll.poll(&mut events, Some(Duration::from_millis(100)))?;
+        if events.is_empty() {
+            throw!(ConnectionTimeout)
+        }
+        let event = events.iter().next().unwrap();
+        assert_eq!(event.token(), SOCK);
+        assert!(event.is_readable());
 
         let mut len = [0; SIZE];
         let mut fds: [RawFd; 6] = [-1; 6];
-        if let Err(e) = stream.recv_with_fd(&mut len, &mut fds) {
-            panic!("Cannot recv fds: {}", e);
-        };
+
+        let rawfd = stream.as_raw_fd();
+        let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
+        stdstream.recv_with_fd(&mut len, &mut fds)?;
+        forget(stdstream);
 
         let len = usize::from_ne_bytes(len);
         let tx = unsafe {
@@ -48,27 +77,123 @@ impl ShamanClient {
             )?
         };
 
+        poll.registry().register(
+            &mut SourceFd(&tx.full_signal().as_raw_fd()),
+            TX,
+            Interest::READABLE,
+        )?;
+        poll.registry().register(
+            &mut SourceFd(&rx.empty_signal().as_raw_fd()),
+            RX,
+            Interest::READABLE,
+        )?;
+
         Self {
             _stream: stream,
             duplex: Duplex::new(tx, rx),
+            poll,
+            receivable: false,
+            sendable: true,
+            events,
         }
     }
 
     #[throws(ShamanError)]
-    pub fn recv(&mut self) -> Option<Vec<u8>> {
-        self.duplex.rx.block_until_readable()?;
+    pub fn poll(&mut self, d: Option<Duration>) {
+        self.poll.poll(&mut self.events, d)?;
+        for event in self.events.iter() {
+            match event.token() {
+                SOCK => {
+                    if event.is_read_closed() {
+                        throw!(ConnectionClosed)
+                    }
+                }
+                TX => self.sendable = true,
+                RX => self.receivable = true,
+                _ => unreachable!("Unknown Token"),
+            }
+        }
+    }
 
-        self.try_recv()?
+    #[throws(ShamanError)]
+    pub fn recv(&mut self) -> Vec<u8> {
+        loop {
+            while !self.receivable {
+                self.poll(None)?;
+            }
+
+            match self.duplex.try_recv()? {
+                Some(v) => break v,
+                None => self.receivable = false,
+            }
+        }
+    }
+
+    #[throws(ShamanError)]
+    pub fn recv_timeout(&mut self, d: Duration) -> Option<Vec<u8>> {
+        if self.receivable {
+            match self.duplex.try_recv()? {
+                Some(v) => return Some(v),
+                None => self.receivable = false,
+            }
+        }
+        self.poll(Some(d))?;
+
+        self.duplex.try_recv()?
     }
 
     #[throws(ShamanError)]
     pub fn try_recv(&mut self) -> Option<Vec<u8>> {
-        self.duplex.recv()?
+        if self.receivable {
+            match self.duplex.try_recv()? {
+                Some(v) => return Some(v),
+                None => self.receivable = false,
+            }
+        }
+        self.poll(Some(Duration::from_secs(0)))?;
+
+        self.duplex.try_recv()?
     }
 
     #[throws(ShamanError)]
     pub fn send(&mut self, data: &[u8]) {
+        if self.sendable {
+            match self.duplex.send(data) {
+                Ok(_) => return,
+                Err(ShamanError::SenderFull) => {
+                    self.sendable = false;
+                }
+                Err(e) => throw!(e),
+            }
+        }
+        while !self.sendable {
+            self.poll(None)?;
+        }
+
         self.duplex.send(data)?;
+    }
+
+    #[throws(ShamanError)]
+    pub fn try_send(&mut self, data: &[u8]) -> bool {
+        if self.sendable {
+            match self.duplex.send(data) {
+                Ok(_) => return true,
+                Err(ShamanError::SenderFull) => {
+                    self.sendable = false;
+                    return false;
+                }
+                Err(e) => throw!(e),
+            }
+        }
+        self.poll(Some(Duration::from_secs(0)))?;
+        match self.duplex.send(data) {
+            Ok(_) => true,
+            Err(ShamanError::SenderFull) => {
+                self.sendable = false;
+                false
+            }
+            Err(e) => throw!(e),
+        }
     }
 
     /// Get the RawFd to get the notification when the send side is not full.

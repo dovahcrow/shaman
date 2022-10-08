@@ -3,11 +3,13 @@ use fehler::{throw, throws};
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
 use std::collections::VecDeque;
 
+const SIZEM1: usize = SIZE - 1;
+
 pub struct Duplex {
     pub(crate) tx: IPCSender<u8>,
     pub(crate) rx: IPCReceiver<u8>,
     tx_buf: VecDeque<u8>,
-    rx_buf: VecDeque<u8>,
+    rx_buf: Vec<u8>,
 }
 
 impl Duplex {
@@ -16,7 +18,7 @@ impl Duplex {
             tx,
             rx,
             tx_buf: VecDeque::new(),
-            rx_buf: VecDeque::new(),
+            rx_buf: Vec::new(),
         }
     }
 
@@ -27,20 +29,6 @@ impl Duplex {
             let status = unsafe {
                 self.tx
                     .send_trusted(|buf| write_vec_deque_and_trunc(buf, &mut self.tx_buf))?
-            };
-            remaining = status.remaining;
-        }
-    }
-
-    #[throws(ShamanError)]
-    pub fn pull(&mut self) {
-        let mut remaining = 1;
-        while remaining != 0 {
-            let status = unsafe {
-                self.rx.receive_trusted(|data| {
-                    self.rx_buf.extend(data);
-                    data.len()
-                })?
             };
             remaining = status.remaining;
         }
@@ -76,24 +64,65 @@ impl Duplex {
 
     // returns data with the length
     #[throws(ShamanError)]
-    pub fn recv(&mut self) -> Option<Vec<u8>> {
-        self.pull()?;
+    pub fn try_recv_with<F, R>(&mut self, mut f: F) -> Option<R>
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        let mut ret = None;
+        let mut remaining = 1;
+        while ret.is_none() && remaining != 0 {
+            let status = unsafe {
+                match self.rx_buf.len() {
+                    0 => self.rx.receive_trusted(|data| {
+                        if data.len() < SIZE {
+                            self.rx_buf.extend(data);
+                            return data.len();
+                        }
 
-        if self.rx_buf.len() < SIZE {
-            return None;
-        }
-        let mut n = [0; SIZE];
-        let mut iter = self.rx_buf.iter();
-        for i in 0..SIZE {
-            n[i] = *iter.next().unwrap();
-        }
-        let n = usize::from_ne_bytes(n);
+                        let len = usize::from_ne_bytes(data[..SIZE].try_into().unwrap());
+                        if data.len() < SIZE + len {
+                            self.rx_buf.extend(data);
+                            return data.len();
+                        }
+                        ret = Some(f(&data[SIZE..SIZE + len]));
 
-        if self.rx_buf.len() < n + SIZE {
-            return None;
+                        SIZE + len
+                    })?,
+                    1..=SIZEM1 => self.rx.receive_trusted(|data| {
+                        let n = data.len().min(SIZE - self.rx_buf.len());
+                        self.rx_buf.extend(&data[..n]);
+                        n
+                    })?,
+                    n => {
+                        let len = usize::from_ne_bytes(self.rx_buf[..SIZE].try_into().unwrap());
+                        let remaining_len = len - (n - SIZE);
+                        let status = self.rx.receive_trusted(|data| {
+                            let n = data.len().min(remaining_len);
+                            self.rx_buf.extend(&data[..n]);
+                            n
+                        })?;
+
+                        assert!(self.rx_buf.len() <= len + SIZE);
+                        if self.rx_buf.len() == len + SIZE {
+                            ret = Some(f(&self.rx_buf[SIZE..]));
+                            self.rx_buf.clear();
+                        }
+
+                        status
+                    }
+                }
+            };
+
+            remaining = status.remaining;
         }
 
-        Some(self.rx_buf.drain(..n + SIZE).skip(SIZE).collect())
+        ret
+    }
+
+    // returns data with the length
+    #[throws(ShamanError)]
+    pub fn try_recv(&mut self) -> Option<Vec<u8>> {
+        self.try_recv_with(|data| data.to_vec())?
     }
 }
 
@@ -105,7 +134,7 @@ fn write_vec_deque_and_trunc(buf: &mut [u8], vd: &mut VecDeque<u8>) -> usize {
 
     // buf.len().saturating_sub(n) is how many bytes that can be still written into buf
     let m = buf.len().saturating_sub(n).min(buf2.len());
-    buf[n..m].copy_from_slice(&buf2[..m]);
+    buf[n..n + m].copy_from_slice(&buf2[..m]);
 
     drop(vd.drain(..n + m));
 

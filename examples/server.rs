@@ -13,8 +13,8 @@ use std::{
 struct Handler;
 
 impl MessageHandler for Handler {
-    fn on_data(&mut self, conn_id: usize, data: Vec<u8>, handle: &ShamanServerHandle) {
-        let req: Request = bincode::deserialize(&data).unwrap();
+    fn on_data(&mut self, conn_id: usize, data: &[u8], handle: &ShamanServerHandle) {
+        let req: Request = bincode::deserialize(data).unwrap();
         let _ = handle.send((
             Some(conn_id),
             bincode::serialize(&Response::Success {
@@ -46,6 +46,6 @@ fn main() {
             })?,
         ))?;
 
-        sleep(Duration::from_secs(1));
+        sleep(Duration::from_millis(10));
     }
 }
