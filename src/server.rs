@@ -31,15 +31,17 @@ use std::{
 const SERVER: Token = Token(0);
 const WAKER: Token = Token(1);
 
-pub trait RequestHandler {
-    fn handle(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle);
+pub trait MessageHandler {
+    fn on_connect(&mut self, _: ConnId, _: &ShamanServerHandle) {}
+    fn on_data(&mut self, _: ConnId, _: Vec<u8>, _: &ShamanServerHandle) {}
+    fn on_disconnect(&mut self, _: ConnId) {}
 }
 
-impl<T> RequestHandler for T
+impl<T> MessageHandler for T
 where
     T: FnMut(ConnId, Vec<u8>, &ShamanServerHandle),
 {
-    fn handle(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle) {
+    fn on_data(&mut self, conn_id: ConnId, data: Vec<u8>, handle: &ShamanServerHandle) {
         self(conn_id, data, handle)
     }
 }
@@ -63,7 +65,7 @@ pub struct ShamanServer<H> {
     poll: Poll,
     queue: Arc<NotificationQueue>, // Notification queue for resp_rx
     resp_rx: StdReceiver<(Option<ConnId>, Vec<u8>)>, // None if broadcast
-    request_handler: H,
+    message_handler: H,
 
     handle: ShamanServerHandle,
 }
@@ -93,7 +95,7 @@ impl ShamanServerHandle {
 
 impl<H> ShamanServer<H>
 where
-    H: RequestHandler + Send + 'static,
+    H: MessageHandler + Send + 'static,
 {
     pub fn spawn(self) {
         spawn(move || match self.start() {
@@ -105,10 +107,10 @@ where
 
 impl<H> ShamanServer<H>
 where
-    H: RequestHandler,
+    H: MessageHandler,
 {
     #[throws(ShamanError)]
-    pub fn new<P>(path: P, capacity: usize, req_handler: H) -> (Self, ShamanServerHandle)
+    pub fn new<P>(path: P, capacity: usize, message_handler: H) -> (Self, ShamanServerHandle)
     where
         P: AsRef<Path>,
     {
@@ -141,7 +143,7 @@ where
                 poll,
                 queue,
                 resp_rx,
-                request_handler: req_handler,
+                message_handler,
                 handle: handle.clone(),
             },
             handle,
@@ -245,6 +247,7 @@ where
                     self.tx_token_to_connection.insert(tx_token, id);
                     self.rx_token_to_connection.insert(rx_token, id);
                     new_conns.push((id, tx_token, rx_token));
+                    self.message_handler.on_connect(id.0, &self.handle);
                 }
                 Err(e) if would_block(&e) => break,
                 Err(e) => throw!(e),
@@ -285,7 +288,7 @@ where
             let conn = self.connections.get_mut(conn_id).unwrap();
 
             while let Some(data) = conn.duplex.recv()? {
-                self.request_handler.handle(conn_id.0, data, &self.handle);
+                self.message_handler.on_data(conn_id.0, data, &self.handle);
             }
             return;
         }
@@ -303,6 +306,8 @@ where
                     self.poll
                         .registry()
                         .deregister(&mut SourceFd(&conn.duplex.rx.empty_signal().as_raw_fd()))?;
+
+                    self.message_handler.on_disconnect(event.token().0);
                 }
                 None => {
                     error!("Connection {} not found", event.token().0)

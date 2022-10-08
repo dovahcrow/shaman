@@ -2,7 +2,7 @@ mod shared;
 
 use anyhow::Error;
 use fehler::throws;
-use shaman::{RequestHandler, ShamanServer, ShamanServerHandle};
+use shaman::{MessageHandler, ShamanServer, ShamanServerHandle};
 use shared::{Request, Response};
 use std::{
     fs::remove_file,
@@ -12,8 +12,8 @@ use std::{
 
 struct Handler;
 
-impl RequestHandler for Handler {
-    fn handle(&mut self, conn_id: usize, data: Vec<u8>, handle: &ShamanServerHandle) {
+impl MessageHandler for Handler {
+    fn on_data(&mut self, conn_id: usize, data: Vec<u8>, handle: &ShamanServerHandle) {
         let req: Request = bincode::deserialize(&data).unwrap();
         let _ = handle.send((
             Some(conn_id),

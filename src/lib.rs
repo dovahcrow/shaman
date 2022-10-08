@@ -7,7 +7,7 @@ mod types;
 pub use crate::types::*;
 pub use client::ShamanClient;
 pub use errors::ShamanError;
-pub use server::{RequestHandler, ShamanServer, ShamanServerHandle};
+pub use server::{MessageHandler, ShamanServer, ShamanServerHandle};
 use std::mem::size_of;
 
 const SIZE: usize = size_of::<usize>();
