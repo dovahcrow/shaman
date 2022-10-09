@@ -1,4 +1,4 @@
-use crate::{duplex::Duplex, errors::ShamanError, types::*};
+use crate::{duplex::Duplex, errors::ShamanError, types::*, SIZE};
 use fehler::{throw, throws};
 use log::{error, info};
 use mio::{
@@ -12,6 +12,7 @@ use mio_misc::{
 };
 use sendfd::SendWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
+use std::io::Read;
 use std::{
     collections::HashMap,
     fs::remove_file,
@@ -48,12 +49,12 @@ where
 
 pub struct Connection {
     pub(crate) stream: UnixStream,
-    duplex: Duplex,
+    duplex: Option<Duplex>,
 }
 
 pub struct ShamanServer<H> {
     socket_path: PathBuf,
-    capacity: usize,
+
     socket_listener: UnixListener,
     connections: HashMap<Token, Connection>, // connection id -> connection
     tx_token_to_connection: HashMap<Token, Token>, // tx poll token -> connection id
@@ -110,7 +111,7 @@ where
     H: MessageHandler,
 {
     #[throws(ShamanError)]
-    pub fn new<P>(path: P, capacity: usize, message_handler: H) -> (Self, ShamanServerHandle)
+    pub fn new<P>(path: P, message_handler: H) -> (Self, ShamanServerHandle)
     where
         P: AsRef<Path>,
     {
@@ -134,7 +135,6 @@ where
         (
             Self {
                 socket_path: path.to_owned(),
-                capacity,
                 socket_listener: listener,
                 connections,
                 next_poll_token: 2,
@@ -161,32 +161,7 @@ where
 
             for event in events.iter() {
                 match event.token() {
-                    SERVER => {
-                        let new_conns = self.incoming_handler()?;
-                        for (id, tx_token, rx_token) in new_conns {
-                            let conn = self.connections.get_mut(&id).unwrap();
-
-                            self.poll.registry().register(
-                                &mut conn.stream,
-                                id,
-                                Interest::READABLE,
-                            )?;
-
-                            self.poll.registry().register(
-                                &mut SourceFd(&conn.duplex.tx.full_signal().as_raw_fd()),
-                                tx_token,
-                                Interest::READABLE,
-                            )?;
-
-                            self.poll.registry().register(
-                                &mut SourceFd(&conn.duplex.rx.empty_signal().as_raw_fd()),
-                                rx_token,
-                                Interest::READABLE,
-                            )?;
-
-                            info!("Registered new connection {}", id.0);
-                        }
-                    }
+                    SERVER => self.incoming_handler()?,
                     WAKER => self.response_handler()?,
                     _ => self.ipc_handler(event)?,
                 }
@@ -195,96 +170,71 @@ where
     }
 
     #[throws(ShamanError)]
-    fn incoming_handler(&mut self) -> Vec<(Token, Token, Token)> {
-        let mut new_conns = vec![];
-
+    fn incoming_handler(&mut self) {
         loop {
             match self.socket_listener.accept() {
-                Ok((stream, _)) => {
-                    let rx = match IPCReceiver::new(self.capacity) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Cannot create receiver: {}", e);
-                            continue;
-                        }
-                    };
-                    let mr = rx.memfd().as_file().as_raw_fd();
-                    let er = rx.empty_signal().as_raw_fd();
-                    let fr = rx.full_signal().as_raw_fd();
-
-                    let tx = match IPCSender::new(self.capacity) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Cannot create sender: {}", e);
-                            continue;
-                        }
-                    };
-                    let ms = tx.memfd().as_file().as_raw_fd();
-                    let es = tx.empty_signal().as_raw_fd();
-                    let fs = tx.full_signal().as_raw_fd();
-
-                    let rawfd = stream.as_raw_fd();
-                    let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
-                    if let Err(e) = stdstream
-                        .send_with_fd(&self.capacity.to_ne_bytes(), &[mr, er, fr, ms, es, fs])
-                    {
-                        error!("Cannot send fds: {}", e);
-                        continue;
-                    };
-                    forget(stdstream);
-
+                Ok((mut stream, _)) => {
                     let id = self.next_token();
-                    let tx_token = self.next_token();
-                    let rx_token = self.next_token();
-
+                    self.poll
+                        .registry()
+                        .register(&mut stream, id, Interest::READABLE)?;
                     self.connections.insert(
                         id,
                         Connection {
                             stream,
-                            duplex: Duplex::new(tx, rx),
+                            duplex: None,
                         },
                     );
-                    self.tx_token_to_connection.insert(tx_token, id);
-                    self.rx_token_to_connection.insert(rx_token, id);
-                    new_conns.push((id, tx_token, rx_token));
-                    self.message_handler.on_connect(id.0, &self.handle);
+                    info!("Connection {} connected", id.0);
                 }
                 Err(e) if would_block(&e) => break,
                 Err(e) => throw!(e),
             }
         }
-
-        new_conns
     }
 
     #[throws(ShamanError)]
     fn response_handler(&mut self) {
-        while let Some(_) = self.queue.pop() {
-            while let Ok((id, message)) = self.resp_rx.try_recv() {
-                match id {
-                    Some(id) => {
-                        let connection = match self.connections.get_mut(&Token(id)) {
-                            Some(conn) => conn,
-                            None => continue,
+        while let Some(_) = self.queue.pop() {}
+        while let Ok((id, message)) = self.resp_rx.try_recv() {
+            match id {
+                Some(id) => {
+                    let connection = match self.connections.get_mut(&Token(id)) {
+                        Some(conn) => conn,
+                        None => continue,
+                    };
+                    let duplex = match connection.duplex.as_mut() {
+                        Some(duplex) => duplex,
+                        None => {
+                            error!("Connection {} not established", id);
+                            continue;
+                        }
+                    };
+
+                    match duplex.send(&message) {
+                        Ok(_) => {}
+                        Err(ShamanError::SenderFull) => {
+                            error!("Sender for connection {} is full, drop message", id);
+                        }
+                        Err(e) => throw!(e),
+                    };
+                }
+                None => {
+                    for (id, connection) in &mut self.connections {
+                        let duplex = match connection.duplex.as_mut() {
+                            Some(duplex) => duplex,
+                            None => {
+                                continue;
+                            }
                         };
-                        match connection.duplex.send(&message) {
+
+                        match duplex.send(&message) {
                             Ok(_) => {}
                             Err(ShamanError::SenderFull) => {
-                                error!("Sender for connection {} is full, drop message", id);
+                                error!("Sender for connection {} is full, drop message", id.0);
                             }
                             Err(e) => throw!(e),
                         };
-                    }
-                    None => {
-                        for (id, connection) in &mut self.connections {
-                            match connection.duplex.send(&message) {
-                                Ok(_) => {}
-                                Err(ShamanError::SenderFull) => {
-                                    error!("Sender for connection {} is full, drop message", id.0);
-                                }
-                                Err(e) => throw!(e),
-                            };
-                        }
                     }
                 }
             }
@@ -295,42 +245,123 @@ where
     fn ipc_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
-            conn.duplex.flush()?;
+            conn.duplex.as_mut().unwrap().flush()?;
             return;
         }
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
             let conn = self.connections.get_mut(conn_id).unwrap();
 
-            while let Some(_) = conn
-                .duplex
-                .try_recv_with(|data| self.message_handler.on_data(conn_id.0, data, &self.handle))?
-            {
-            }
+            while let Some(_) =
+                conn.duplex.as_mut().unwrap().try_recv_with(|data| {
+                    self.message_handler.on_data(conn_id.0, data, &self.handle)
+                })?
+            {}
             return;
         }
 
         if event.is_read_closed() {
-            match self.connections.remove(&event.token()) {
-                Some(mut conn) => {
-                    info!("Connection {} closed", event.token().0);
-                    self.poll.registry().deregister(&mut conn.stream)?;
-
-                    self.poll
-                        .registry()
-                        .deregister(&mut SourceFd(&conn.duplex.tx.full_signal().as_raw_fd()))?;
-
-                    self.poll
-                        .registry()
-                        .deregister(&mut SourceFd(&conn.duplex.rx.empty_signal().as_raw_fd()))?;
-
-                    self.message_handler.on_disconnect(event.token().0);
-                }
+            let mut conn = match self.connections.remove(&event.token()) {
+                Some(conn) => conn,
                 None => {
-                    error!("Connection {} not found", event.token().0)
+                    error!("Connection {} not found", event.token().0);
+                    return;
                 }
             };
 
+            info!("Connection {} closed", event.token().0);
+            self.poll.registry().deregister(&mut conn.stream)?;
+
+            if let Some(duplex) = conn.duplex {
+                self.poll
+                    .registry()
+                    .deregister(&mut SourceFd(&duplex.tx.full_signal().as_raw_fd()))?;
+
+                self.poll
+                    .registry()
+                    .deregister(&mut SourceFd(&duplex.rx.empty_signal().as_raw_fd()))?;
+            }
+
+            self.message_handler.on_disconnect(event.token().0);
+            return;
+        }
+
+        if event.is_readable() {
+            let id = event.token().0;
+
+            let conn = match self.connections.get_mut(&event.token()) {
+                Some(conn) => conn,
+                None => {
+                    error!("Connection {} not found", id);
+                    return;
+                }
+            };
+
+            let mut capacity = [0; SIZE];
+            conn.stream.read_exact(&mut capacity)?;
+            let capacity = usize::from_ne_bytes(capacity);
+
+            let rx = match IPCReceiver::new(capacity) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Cannot create receiver: {}", e);
+                    return;
+                }
+            };
+
+            let tx = match IPCSender::new(capacity) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Cannot create sender: {}", e);
+                    return;
+                }
+            };
+
+            let rawfd = conn.stream.as_raw_fd();
+            let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
+            if let Err(e) = stdstream.send_with_fd(
+                &capacity.to_ne_bytes(),
+                &[
+                    rx.memfd().as_file().as_raw_fd(),
+                    rx.empty_signal().as_raw_fd(),
+                    rx.full_signal().as_raw_fd(),
+                    tx.memfd().as_file().as_raw_fd(),
+                    tx.empty_signal().as_raw_fd(),
+                    tx.full_signal().as_raw_fd(),
+                ],
+            ) {
+                error!("Cannot send fds: {}", e);
+                return;
+            };
+            forget(stdstream);
+
+            conn.duplex = Some(Duplex::new(tx, rx));
+
+            // let tx_token = self.next_token();
+            // let rx_token = self.next_token();
+            let tx_token = Token(self.next_poll_token);
+            self.next_poll_token += 1;
+            let rx_token = Token(self.next_poll_token);
+            self.next_poll_token += 1;
+
+            self.tx_token_to_connection.insert(tx_token, Token(id));
+            self.rx_token_to_connection.insert(rx_token, Token(id));
+
+            self.poll.registry().register(
+                &mut SourceFd(&conn.duplex.as_ref().unwrap().tx.full_signal().as_raw_fd()),
+                tx_token,
+                Interest::READABLE,
+            )?;
+
+            self.poll.registry().register(
+                &mut SourceFd(&conn.duplex.as_ref().unwrap().rx.empty_signal().as_raw_fd()),
+                rx_token,
+                Interest::READABLE,
+            )?;
+
+            self.message_handler
+                .on_connect(event.token().0, &self.handle);
+            info!("Connection {} established with capacity: {}", id, capacity);
             return;
         }
 

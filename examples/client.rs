@@ -10,7 +10,7 @@ use std::str;
 #[throws(Error)]
 fn main() {
     env_logger::init();
-    let mut client = ShamanClient::new("/tmp/shaman.sock")?;
+    let mut client = ShamanClient::new("/tmp/shaman.sock", 1 << 4)?;
 
     client.send(&bincode::serialize(&Request {
         id: 0,

@@ -9,6 +9,7 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
+use std::io::Write;
 use std::mem::forget;
 use std::os::unix::prelude::AsRawFd;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub struct ShamanClient {
 
 impl ShamanClient {
     #[throws(ShamanError)]
-    pub fn new<P>(path: P) -> Self
+    pub fn new<P>(path: P, capacity: usize) -> Self
     where
         P: AsRef<Path>,
     {
@@ -42,14 +43,20 @@ impl ShamanClient {
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(128);
         poll.registry()
+            .register(&mut stream, SOCK, Interest::WRITABLE)?;
+        poll.poll(&mut events, Some(Duration::from_millis(100)))?;
+        if events.is_empty() {
+            throw!(ConnectionTimeout)
+        }
+        stream.write(&capacity.to_ne_bytes())?;
+
+        poll.registry().deregister(&mut stream)?;
+        poll.registry()
             .register(&mut stream, SOCK, Interest::READABLE)?;
         poll.poll(&mut events, Some(Duration::from_millis(100)))?;
         if events.is_empty() {
             throw!(ConnectionTimeout)
         }
-        let event = events.iter().next().unwrap();
-        assert_eq!(event.token(), SOCK);
-        assert!(event.is_readable());
 
         let mut len = [0; SIZE];
         let mut fds: [RawFd; 6] = [-1; 6];

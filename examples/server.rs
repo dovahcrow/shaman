@@ -31,7 +31,7 @@ impl MessageHandler for Handler {
 fn main() {
     env_logger::init();
     let _ = remove_file("/tmp/shaman.sock");
-    let (server, handle) = ShamanServer::new("/tmp/shaman.sock", 1 << 4, Handler)?;
+    let (server, handle) = ShamanServer::new("/tmp/shaman.sock", Handler)?;
 
     server.spawn();
 
