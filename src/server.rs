@@ -320,6 +320,7 @@ where
 
             let mut capacity = [0; SIZE];
             conn.stream.read_exact(&mut capacity)?;
+
             let capacity = usize::from_ne_bytes(capacity);
 
             let rx = match IPCReceiver::new(capacity) {
@@ -338,19 +339,25 @@ where
                 }
             };
 
+            let fds = &[
+                rx.memfd().as_file().as_raw_fd(),
+                rx.empty_signal().as_raw_fd(),
+                rx.full_signal().as_raw_fd(),
+                tx.memfd().as_file().as_raw_fd(),
+                tx.empty_signal().as_raw_fd(),
+                tx.full_signal().as_raw_fd(),
+            ];
+
+            for fd in fds {
+                unsafe {
+                    let flags = libc::fcntl(*fd, libc::F_GETFL, 0);
+                    libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+
             let rawfd = conn.stream.as_raw_fd();
             let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
-            if let Err(e) = stdstream.send_with_fd(
-                &capacity.to_ne_bytes(),
-                &[
-                    rx.memfd().as_file().as_raw_fd(),
-                    rx.empty_signal().as_raw_fd(),
-                    rx.full_signal().as_raw_fd(),
-                    tx.memfd().as_file().as_raw_fd(),
-                    tx.empty_signal().as_raw_fd(),
-                    tx.full_signal().as_raw_fd(),
-                ],
-            ) {
+            if let Err(e) = stdstream.send_with_fd(&capacity.to_ne_bytes(), fds) {
                 error!("Cannot send fds: {}", e);
                 return;
             };
