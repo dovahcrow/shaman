@@ -31,7 +31,7 @@ fn main() {
         let msg = client.recv()?;
         let resp: Response = bincode::deserialize(&msg)?;
         if let Response::Subscription { channel, data } = resp {
-            println!("{}: {}", channel, str::from_utf8(&data)?);
+            println!("{}: {}", channel, data.len());
         }
     }
 }

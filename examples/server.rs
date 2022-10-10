@@ -36,12 +36,17 @@ fn main() {
 
     loop {
         let now = Instant::now();
-        let data = format!("{:?}", now).as_bytes().to_vec();
-        handle.try_broadcast(&bincode::serialize(&Response::Subscription {
+        let mut v = vec![];
+        for _ in 0..1000 {
+            v.push(now);
+        }
+        let data = format!("{:?}", v).as_bytes().to_vec();
+
+        let _ = handle.try_broadcast(&bincode::serialize(&Response::Subscription {
             channel: "Time".into(),
             data,
         })?)?;
 
-        sleep(Duration::from_millis(1));
+        sleep(Duration::from_millis(100));
     }
 }

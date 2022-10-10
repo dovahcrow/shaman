@@ -117,6 +117,7 @@ impl ShamanServerHandle {
     #[throws(ShamanError)]
     pub fn try_broadcast(&self, data: &[u8]) {
         let mut connections = self.connections.lock();
+        let mut last_error = None;
         for conn in connections.values_mut() {
             let duplex = match conn.duplex.as_mut() {
                 Some(duplex) => duplex,
@@ -126,7 +127,13 @@ impl ShamanServerHandle {
                 }
             };
 
-            Duplex::try_send(&mut duplex.tx, &mut duplex.tx_buf, data)?;
+            match Duplex::try_send(&mut duplex.tx, &mut duplex.tx_buf, data) {
+                Ok(_) => {}
+                Err(e) => last_error = Some(e),
+            }; // todo: how to report all errors
+        }
+        if let Some(e) = last_error {
+            throw!(e)
         }
     }
 }
@@ -268,6 +275,7 @@ where
                     Err(e) => throw!(e),
                 }
             }
+
             return;
         }
 

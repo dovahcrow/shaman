@@ -100,8 +100,8 @@ impl ShamanClient {
                 }
                 SOCK if event.is_readable() => {
                     // consume the data  if server send us anything
-                    let mut buf = vec![];
-                    self.stream.read_to_end(&mut buf)?;
+                    let mut buf = [0; 32];
+                    while let Ok(32) = self.stream.read(&mut buf) {}
                 }
                 TX => {
                     let mut buf = [0; 8];

@@ -67,8 +67,10 @@ impl Duplex {
                 tx_buf.extend(&data[n..]);
 
                 orig_len - buf.len()
-            })?
+            })?;
         };
+
+        Self::flush(tx, tx_buf)?;
     }
 
     // returns data with the length
