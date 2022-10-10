@@ -2,7 +2,7 @@ mod shared;
 
 use anyhow::Error;
 use fehler::throws;
-use shaman::{MessageHandler, ShamanServer, ShamanServerHandle};
+use shaman::{MessageHandler, ShamanServer, ShamanServerSendHandle};
 use shared::{Request, Response};
 use std::{
     fs::remove_file,
@@ -13,16 +13,15 @@ use std::{
 struct Handler;
 
 impl MessageHandler for Handler {
-    fn on_data(&mut self, conn_id: usize, data: &[u8], handle: &ShamanServerHandle) {
+    fn on_data(&mut self, data: &[u8], handle: &mut ShamanServerSendHandle) {
         let req: Request = bincode::deserialize(data).unwrap();
-        let _ = handle.send((
-            Some(conn_id),
-            bincode::serialize(&Response::Success {
+        let _ = handle.try_send(
+            &bincode::serialize(&Response::Success {
                 id: req.id,
                 data: req.params,
             })
             .unwrap(),
-        ));
+        );
     }
 }
 
@@ -38,14 +37,11 @@ fn main() {
     loop {
         let now = Instant::now();
         let data = format!("{:?}", now).as_bytes().to_vec();
-        handle.send((
-            None,
-            bincode::serialize(&Response::Subscription {
-                channel: "Time".into(),
-                data,
-            })?,
-        ))?;
+        handle.try_broadcast(&bincode::serialize(&Response::Subscription {
+            channel: "Time".into(),
+            data,
+        })?)?;
 
-        sleep(Duration::from_millis(10));
+        sleep(Duration::from_millis(1));
     }
 }

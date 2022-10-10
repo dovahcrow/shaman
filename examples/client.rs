@@ -18,6 +18,8 @@ fn main() {
         params: b"world".to_vec(),
     })?)?;
 
+    println!("Request sent");
+
     let data = client.recv()?;
     let resp: Response = bincode::deserialize(&data)?;
     if let Response::Success { id, data } = resp {
