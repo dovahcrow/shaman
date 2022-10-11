@@ -73,7 +73,6 @@ impl Duplex {
         Self::flush(tx, tx_buf)?;
     }
 
-    // returns data with the length
     #[throws(ShamanError)]
     pub fn try_recv_with<F, R>(rx: &mut IPCReceiver<u8>, rx_buf: &mut Vec<u8>, mut f: F) -> R
     where
@@ -130,7 +129,6 @@ impl Duplex {
         ret.ok_or(WouldBlock)?
     }
 
-    // returns data with the length
     #[throws(ShamanError)]
     pub fn try_recv(rx: &mut IPCReceiver<u8>, rx_buf: &mut Vec<u8>) -> Vec<u8> {
         Self::try_recv_with(rx, rx_buf, |data| data.to_vec())?

@@ -14,7 +14,9 @@ mio-misc = "2"
 parking_lot = "0.12"
 sendfd = "0.4"
 serde = {version = "1", features = ["derive"]}
-shmem-ipc = "0.2"
+# shmem-ipc = "0.2"
+dashmap = "5"
+shmem-ipc = {git = "https://github.com/diwic/shmem-ipc"}
 thiserror = "1"
 
 [dev-dependencies]

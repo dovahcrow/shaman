@@ -4,12 +4,12 @@ use crate::{
     types::*,
     would_block, SIZE,
 };
+use dashmap::DashMap;
 use fehler::{throw, throws};
 use log::{error, info};
 use mio::{
     event::Event, net::UnixListener, net::UnixStream, unix::SourceFd, Events, Interest, Poll, Token,
 };
-use parking_lot::Mutex;
 use sendfd::SendWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
 use std::collections::VecDeque;
@@ -54,9 +54,9 @@ pub struct ShamanServer<H> {
     socket_path: PathBuf,
 
     socket_listener: UnixListener,
-    connections: Arc<Mutex<HashMap<Token, Connection>>>, // connection id -> connection
-    tx_token_to_connection: HashMap<Token, Token>,       // tx poll token -> connection id
-    rx_token_to_connection: HashMap<Token, Token>,       // rx poll token -> connection id
+    connections: Arc<DashMap<Token, Connection>>, // connection id -> connection
+    tx_token_to_connection: HashMap<Token, Token>, // tx poll token -> connection id
+    rx_token_to_connection: HashMap<Token, Token>, // rx poll token -> connection id
 
     next_poll_token: usize,
 
@@ -87,7 +87,7 @@ impl<'a> ShamanServerSendHandle<'a> {
 #[derive(Clone)]
 pub struct ShamanServerHandle {
     exit: Arc<AtomicBool>,
-    connections: Arc<Mutex<HashMap<Token, Connection>>>,
+    connections: Arc<DashMap<Token, Connection>>,
 }
 
 impl ShamanServerHandle {
@@ -101,8 +101,8 @@ impl ShamanServerHandle {
 
     #[throws(ShamanError)]
     pub fn try_send(&self, conn_id: ConnId, data: &[u8]) {
-        let mut connections = self.connections.lock();
-        let conn = connections
+        let mut conn = self
+            .connections
             .get_mut(&Token(conn_id))
             .ok_or(ConnectionNotFound(conn_id))?;
 
@@ -116,9 +116,9 @@ impl ShamanServerHandle {
 
     #[throws(ShamanError)]
     pub fn try_broadcast(&self, data: &[u8]) {
-        let mut connections = self.connections.lock();
         let mut last_error = None;
-        for conn in connections.values_mut() {
+        for mut pair in self.connections.iter_mut() {
+            let conn = pair.value_mut();
             let duplex = match conn.duplex.as_mut() {
                 Some(duplex) => duplex,
                 None => {
@@ -161,7 +161,7 @@ where
     {
         let path = path.as_ref();
 
-        let connections: Arc<Mutex<HashMap<Token, Connection>>> = Arc::default();
+        let connections: Arc<DashMap<Token, Connection>> = Arc::default();
         let mut listener = UnixListener::bind(path)?;
 
         let poll = Poll::new()?;
@@ -218,9 +218,8 @@ where
                     self.poll
                         .registry()
                         .register(&mut stream, id, Interest::READABLE)?;
-                    let mut connections = self.connections.lock();
 
-                    connections.insert(
+                    self.connections.insert(
                         id,
                         Connection {
                             stream,
@@ -235,11 +234,14 @@ where
         }
     }
 
+    // This function first locks the connection then call the handler
+    // dead lock can happen if the handler locks its internal state
+    // another then another process locks the handler's internal state first
+    // then call the send method on the ShamanServerHandle
     #[throws(ShamanError)]
     fn ipc_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
-            let mut connections = self.connections.lock();
-            let conn = connections.get_mut(conn_id).unwrap();
+            let mut conn = self.connections.get_mut(conn_id).unwrap();
             let duplex = conn.duplex.as_mut().unwrap();
 
             // clear the eventfd
@@ -251,8 +253,7 @@ where
         }
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
-            let mut connections = self.connections.lock();
-            let conn = connections.get_mut(conn_id).unwrap();
+            let mut conn = self.connections.get_mut(conn_id).unwrap();
             let duplex = conn.duplex.as_mut().unwrap();
 
             // clear the eventfd
@@ -280,8 +281,7 @@ where
         }
 
         if event.is_read_closed() {
-            let mut connections = self.connections.lock();
-            let mut conn = match connections.remove(&event.token()) {
+            let (_, mut conn) = match self.connections.remove(&event.token()) {
                 Some(conn) => conn,
                 None => {
                     error!("Connection {} not found", event.token().0);
@@ -309,8 +309,7 @@ where
         if event.is_readable() {
             let conn_id = event.token().0;
 
-            let mut connections = self.connections.lock();
-            let conn = match connections.get_mut(&event.token()) {
+            let mut conn = match self.connections.get_mut(&event.token()) {
                 Some(conn) => conn,
                 None => {
                     error!("Connection {} not found", conn_id);

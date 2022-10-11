@@ -129,6 +129,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "907076dfda823b0b36d2a1bb5f90c96660a5bbcd7729e10727f07858f22c4edc"
+dependencies = [
+ "cfg-if",
+ "hashbrown",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "env_logger"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -160,6 +173,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 
 [[package]]
 name = "hermit-abi"
@@ -257,6 +276,12 @@ dependencies = [
  "log",
  "mio",
 ]
+
+[[package]]
+name = "once_cell"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e82dad04139b71a90c080c8463fe0dc7902db5192d939bd0950f074d014339e1"
 
 [[package]]
 name = "parking_lot"
@@ -366,6 +391,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "dashmap",
  "env_logger",
  "fehler",
  "libc",
@@ -382,8 +408,7 @@ dependencies = [
 [[package]]
 name = "shmem-ipc"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d340bc081c581a0db2cca6a84fb58d3869ccc223be7fbba0cb13a1368d949f49"
+source = "git+https://github.com/diwic/shmem-ipc#3db5cfe5f534c79d4b01f6bddd55d317dc33c32b"
 dependencies = [
  "byteorder",
  "libc",
