@@ -1,5 +1,5 @@
 use crate::{
-    duplex::Duplex,
+    duplex::{BufReceiver, BufSender},
     errors::ShamanError::{self, *},
     types::*,
     would_block, SIZE,
@@ -12,7 +12,6 @@ use mio::{
 };
 use sendfd::SendWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::collections::VecDeque;
 use std::io::Read;
 use std::{
     collections::HashMap,
@@ -31,63 +30,24 @@ use std::{
 const SERVER: Token = Token(0);
 
 pub trait MessageHandler {
-    fn on_connect(&mut self, _: &mut ShamanServerSendHandle) {}
-    fn on_data(&mut self, _: &[u8], _: &mut ShamanServerSendHandle<'_>) {}
+    fn on_connect(&mut self, _: ConnId) {}
+    fn on_data(&mut self, _: ConnId, _: &[u8]) {}
     fn on_disconnect(&mut self, _: ConnId) {}
 }
 
 impl<T> MessageHandler for T
 where
-    T: FnMut(&[u8], &mut ShamanServerSendHandle<'_>),
+    T: FnMut(ConnId, &[u8]),
 {
-    fn on_data(&mut self, data: &[u8], handle: &mut ShamanServerSendHandle<'_>) {
-        self(data, handle)
-    }
-}
-
-pub struct Connection {
-    pub(crate) stream: UnixStream,
-    duplex: Option<Duplex>,
-}
-
-pub struct ShamanServer<H> {
-    socket_path: PathBuf,
-
-    socket_listener: UnixListener,
-    connections: Arc<DashMap<Token, Connection>>, // connection id -> connection
-    tx_token_to_connection: HashMap<Token, Token>, // tx poll token -> connection id
-    rx_token_to_connection: HashMap<Token, Token>, // rx poll token -> connection id
-
-    next_poll_token: usize,
-
-    // communication with outside
-    poll: Poll,
-    message_handler: H,
-
-    handle: ShamanServerHandle,
-}
-
-pub struct ShamanServerSendHandle<'a> {
-    conn_id: ConnId,
-    tx: &'a mut IPCSender<u8>,
-    tx_buf: &'a mut VecDeque<u8>,
-}
-
-impl<'a> ShamanServerSendHandle<'a> {
-    pub fn conn_id(&self) -> ConnId {
-        self.conn_id
-    }
-
-    #[throws(ShamanError)]
-    pub fn try_send(&mut self, data: &[u8]) {
-        Duplex::try_send(&mut self.tx, &mut self.tx_buf, data)?;
+    fn on_data(&mut self, conn_id: ConnId, data: &[u8]) {
+        self(conn_id, data)
     }
 }
 
 #[derive(Clone)]
 pub struct ShamanServerHandle {
     exit: Arc<AtomicBool>,
-    connections: Arc<DashMap<Token, Connection>>,
+    senders: Arc<DashMap<Token, (Token, BufSender)>>,
 }
 
 impl ShamanServerHandle {
@@ -101,39 +61,90 @@ impl ShamanServerHandle {
 
     #[throws(ShamanError)]
     pub fn try_send(&self, conn_id: ConnId, data: &[u8]) {
-        let mut conn = self
-            .connections
+        let mut tx = self
+            .senders
             .get_mut(&Token(conn_id))
             .ok_or(ConnectionNotFound(conn_id))?;
 
-        let duplex = match conn.duplex.as_mut() {
-            Some(duplex) => duplex,
-            None => throw!(ConnectionNotEstablished(conn_id)),
-        };
-
-        Duplex::try_send(&mut duplex.tx, &mut duplex.tx_buf, data)?;
+        tx.1.try_send(data)?;
     }
 
     #[throws(ShamanError)]
     pub fn try_broadcast(&self, data: &[u8]) {
         let mut last_error = None;
-        for mut pair in self.connections.iter_mut() {
-            let conn = pair.value_mut();
-            let duplex = match conn.duplex.as_mut() {
-                Some(duplex) => duplex,
-                None => {
-                    // The connection is still being established, skip
-                    continue;
-                }
-            };
+        for mut pair in self.senders.iter_mut() {
+            let tx = &mut pair.value_mut().1;
 
-            match Duplex::try_send(&mut duplex.tx, &mut duplex.tx_buf, data) {
+            match tx.try_send(data) {
                 Ok(_) => {}
                 Err(e) => last_error = Some(e),
             }; // todo: how to report all errors
         }
         if let Some(e) = last_error {
             throw!(e)
+        }
+    }
+}
+
+pub struct ShamanServer<H> {
+    socket_path: PathBuf,
+
+    socket_listener: UnixListener,
+    streams: HashMap<Token, UnixStream>, // connection id -> stream
+    receivers: HashMap<Token, (Token, BufReceiver)>, // connection id -> receiver
+    senders: Arc<DashMap<Token, (Token, BufSender)>>, // connection id -> sender
+    tx_token_to_connection: HashMap<Token, Token>, // tx poll token -> connection id
+    rx_token_to_connection: HashMap<Token, Token>, // rx poll token -> connection id
+
+    next_poll_token: usize,
+
+    // communication with outside
+    poll: Poll,
+    message_handler: Option<H>,
+
+    handle: ShamanServerHandle,
+}
+
+impl<H> ShamanServer<H> {
+    pub fn handle(&self) -> ShamanServerHandle {
+        self.handle.clone()
+    }
+
+    #[throws(ShamanError)]
+    pub fn new<P>(path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        let path = path.as_ref();
+
+        let senders: Arc<DashMap<Token, (Token, BufSender)>> = Arc::default();
+        let mut listener = UnixListener::bind(path)?;
+
+        let poll = Poll::new()?;
+
+        poll.registry()
+            .register(&mut listener, SERVER, Interest::READABLE)?;
+
+        let exit = Arc::new(AtomicBool::new(false));
+        let handle = ShamanServerHandle {
+            senders: senders.clone(),
+            exit,
+        };
+
+        Self {
+            socket_path: path.to_owned(),
+            socket_listener: listener,
+
+            streams: HashMap::new(),
+            senders,
+            receivers: HashMap::new(),
+
+            next_poll_token: 1,
+            rx_token_to_connection: HashMap::new(),
+            tx_token_to_connection: HashMap::new(),
+            poll,
+            message_handler: None,
+            handle,
         }
     }
 }
@@ -154,41 +165,8 @@ impl<H> ShamanServer<H>
 where
     H: MessageHandler,
 {
-    #[throws(ShamanError)]
-    pub fn new<P>(path: P, message_handler: H) -> (Self, ShamanServerHandle)
-    where
-        P: AsRef<Path>,
-    {
-        let path = path.as_ref();
-
-        let connections: Arc<DashMap<Token, Connection>> = Arc::default();
-        let mut listener = UnixListener::bind(path)?;
-
-        let poll = Poll::new()?;
-
-        poll.registry()
-            .register(&mut listener, SERVER, Interest::READABLE)?;
-
-        let exit = Arc::new(AtomicBool::new(false));
-        let handle = ShamanServerHandle {
-            connections: connections.clone(),
-            exit,
-        };
-
-        (
-            Self {
-                socket_path: path.to_owned(),
-                socket_listener: listener,
-                connections,
-                next_poll_token: 1,
-                rx_token_to_connection: HashMap::new(),
-                tx_token_to_connection: HashMap::new(),
-                poll,
-                message_handler,
-                handle: handle.clone(),
-            },
-            handle,
-        )
+    pub fn set_message_handler(&mut self, message_handler: H) {
+        self.message_handler = Some(message_handler)
     }
 
     #[allow(unreachable_code)]
@@ -219,13 +197,7 @@ where
                         .registry()
                         .register(&mut stream, id, Interest::READABLE)?;
 
-                    self.connections.insert(
-                        id,
-                        Connection {
-                            stream,
-                            duplex: None,
-                        },
-                    );
+                    self.streams.insert(id, stream);
                     info!("Connection {} connected", id.0);
                 }
                 Err(e) if would_block(&e) => break,
@@ -241,33 +213,28 @@ where
     #[throws(ShamanError)]
     fn ipc_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
-            let mut conn = self.connections.get_mut(conn_id).unwrap();
-            let duplex = conn.duplex.as_mut().unwrap();
+            let mut tx = self.senders.get_mut(conn_id).unwrap();
 
             // clear the eventfd
             let mut buf = [0; 8];
-            duplex.send_notifier().read_exact(&mut buf)?;
+            tx.1.notifier().read_exact(&mut buf)?;
 
-            Duplex::flush(&mut duplex.tx, &mut duplex.tx_buf)?;
+            tx.1.flush()?;
             return;
         }
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
-            let mut conn = self.connections.get_mut(conn_id).unwrap();
-            let duplex = conn.duplex.as_mut().unwrap();
+            let (_, ref mut rx) = self.receivers.get_mut(conn_id).unwrap();
 
             // clear the eventfd
             let mut buf = [0; 8];
-            duplex.recv_notifier().read_exact(&mut buf)?;
+            rx.notifier().read_exact(&mut buf)?;
 
-            let mut handle = ShamanServerSendHandle {
-                conn_id: conn_id.0,
-                tx: &mut duplex.tx,
-                tx_buf: &mut duplex.tx_buf,
-            };
             loop {
-                let ret = Duplex::try_recv_with(&mut duplex.rx, &mut duplex.rx_buf, |data| {
-                    self.message_handler.on_data(data, &mut handle)
+                let ret = rx.try_recv_with(|data| {
+                    if let Some(mh) = self.message_handler.as_mut() {
+                        mh.on_data(conn_id.0, data)
+                    }
                 });
 
                 match ret {
@@ -281,35 +248,42 @@ where
         }
 
         if event.is_read_closed() {
-            let (_, mut conn) = match self.connections.remove(&event.token()) {
-                Some(conn) => conn,
+            let conn_id = event.token().0;
+
+            let mut stream = match self.streams.remove(&Token(conn_id)) {
+                Some(stream) => stream,
                 None => {
-                    error!("Connection {} not found", event.token().0);
+                    error!("Connection {} not found", conn_id);
                     return;
                 }
             };
 
-            info!("Connection {} closed", event.token().0);
-            self.poll.registry().deregister(&mut conn.stream)?;
+            info!("Connection {} closed", conn_id);
+            self.poll.registry().deregister(&mut stream)?;
 
-            if let Some(duplex) = conn.duplex {
+            if let Some((_, (token, sender))) = self.senders.remove(&Token(conn_id)) {
                 self.poll
                     .registry()
-                    .deregister(&mut SourceFd(&duplex.send_notifier().as_raw_fd()))?;
-
+                    .deregister(&mut SourceFd(&sender.notifier().as_raw_fd()))?;
+                self.tx_token_to_connection.remove(&token);
+            }
+            if let Some((token, receiver)) = self.receivers.remove(&Token(conn_id)) {
                 self.poll
                     .registry()
-                    .deregister(&mut SourceFd(&duplex.recv_notifier().as_raw_fd()))?;
+                    .deregister(&mut SourceFd(&receiver.notifier().as_raw_fd()))?;
+                self.rx_token_to_connection.remove(&token);
             }
 
-            self.message_handler.on_disconnect(event.token().0);
+            if let Some(mh) = self.message_handler.as_mut() {
+                mh.on_disconnect(conn_id);
+            }
             return;
         }
 
         if event.is_readable() {
             let conn_id = event.token().0;
 
-            let mut conn = match self.connections.get_mut(&event.token()) {
+            let stream = match self.streams.get_mut(&event.token()) {
                 Some(conn) => conn,
                 None => {
                     error!("Connection {} not found", conn_id);
@@ -318,7 +292,7 @@ where
             };
 
             let mut capacity = [0; SIZE];
-            conn.stream.read_exact(&mut capacity)?;
+            stream.read_exact(&mut capacity)?;
 
             let capacity = usize::from_ne_bytes(capacity);
 
@@ -354,7 +328,7 @@ where
                 }
             }
 
-            let rawfd = conn.stream.as_raw_fd();
+            let rawfd = stream.as_raw_fd();
             let stdstream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(rawfd) };
             if let Err(e) = stdstream.send_with_fd(&capacity.to_ne_bytes(), fds) {
                 error!("Cannot send fds: {}", e);
@@ -362,37 +336,36 @@ where
             };
             forget(stdstream);
 
-            conn.duplex = Some(Duplex::new(tx, rx));
+            let bufsender = BufSender::new(tx);
+            let bufreceiver = BufReceiver::new(rx);
 
-            // let tx_token = self.next_token();
-            // let rx_token = self.next_token();
             let tx_token = Token(self.next_poll_token);
             self.next_poll_token += 1;
             let rx_token = Token(self.next_poll_token);
             self.next_poll_token += 1;
 
-            self.tx_token_to_connection.insert(tx_token, Token(conn_id));
-            self.rx_token_to_connection.insert(rx_token, Token(conn_id));
-
             self.poll.registry().register(
-                &mut SourceFd(&conn.duplex.as_ref().unwrap().send_notifier().as_raw_fd()),
+                &mut SourceFd(&bufsender.notifier().as_raw_fd()),
                 tx_token,
                 Interest::READABLE,
             )?;
 
             self.poll.registry().register(
-                &mut SourceFd(&conn.duplex.as_ref().unwrap().recv_notifier().as_raw_fd()),
+                &mut SourceFd(&bufreceiver.notifier().as_raw_fd()),
                 rx_token,
                 Interest::READABLE,
             )?;
-            let duplex = conn.duplex.as_mut().unwrap();
-            let mut handle = ShamanServerSendHandle {
-                conn_id: conn_id,
-                tx: &mut duplex.tx,
-                tx_buf: &mut duplex.tx_buf,
-            };
 
-            self.message_handler.on_connect(&mut handle);
+            self.senders.insert(Token(conn_id), (tx_token, bufsender));
+            self.receivers
+                .insert(Token(conn_id), (tx_token, bufreceiver));
+
+            self.tx_token_to_connection.insert(tx_token, Token(conn_id));
+            self.rx_token_to_connection.insert(rx_token, Token(conn_id));
+
+            if let Some(mh) = self.message_handler.as_mut() {
+                mh.on_connect(conn_id);
+            }
             info!(
                 "Connection {} established with capacity: {}",
                 conn_id, capacity

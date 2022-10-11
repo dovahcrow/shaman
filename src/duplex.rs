@@ -17,64 +17,83 @@ const SIZEM1: usize = SIZE - 1;
 /// Consecutive sends will first try to flush the tx_buf to the channel before send any new message.
 /// For recv, if the channel has a complete message, directly receive it. Otherwise receive whatever is available
 /// to the rx_buf.
-pub struct Duplex {
-    pub(crate) tx: IPCSender<u8>,
-    pub(crate) rx: IPCReceiver<u8>,
-    pub(crate) tx_buf: VecDeque<u8>,
-    pub(crate) rx_buf: Vec<u8>,
+///
+
+pub struct BufSender {
+    tx: IPCSender<u8>,
+    spill: VecDeque<u8>,
 }
 
-impl Duplex {
-    pub fn new(tx: IPCSender<u8>, rx: IPCReceiver<u8>) -> Self {
-        Duplex {
+impl BufSender {
+    pub fn new(tx: IPCSender<u8>) -> Self {
+        BufSender {
             tx,
-            rx,
-            tx_buf: VecDeque::new(),
-            rx_buf: Vec::new(),
+            spill: VecDeque::new(),
         }
     }
 
     #[throws(ShamanError)]
-    pub fn flush(tx: &mut IPCSender<u8>, tx_buf: &mut VecDeque<u8>) {
+    pub fn flush(&mut self) {
         let mut remaining = 1;
-        while remaining != 0 && !tx_buf.is_empty() {
-            let status = unsafe { tx.send_trusted(|buf| write_vec_deque_and_trunc(buf, tx_buf))? };
+        while remaining != 0 && !self.spill.is_empty() {
+            let status = unsafe {
+                self.tx
+                    .send_trusted(|buf| write_vec_deque_and_trunc(buf, &mut self.spill))?
+            };
             remaining = status.remaining;
         }
     }
 
     #[throws(ShamanError)]
-    pub fn try_send(tx: &mut IPCSender<u8>, tx_buf: &mut VecDeque<u8>, data: &[u8]) {
+    pub fn try_send(&mut self, data: &[u8]) {
         // flush the pending data first
-        Self::flush(tx, tx_buf)?;
+        self.flush()?;
 
-        if !tx_buf.is_empty() {
+        if !self.spill.is_empty() {
             // the IPCSender is full, we send no more
             throw!(ShamanError::WouldBlock);
         }
 
         unsafe {
-            tx.send_trusted(|mut buf| {
+            self.tx.send_trusted(|mut buf| {
                 let orig_len = buf.len();
 
                 let len_data = data.len().to_ne_bytes();
                 let n = write_slice(buf, &len_data);
                 buf = &mut buf[n..];
-                tx_buf.extend(&len_data[n..]);
+                self.spill.extend(&len_data[n..]);
 
                 let n = write_slice(buf, &data);
                 buf = &mut buf[n..];
-                tx_buf.extend(&data[n..]);
+                self.spill.extend(&data[n..]);
 
                 orig_len - buf.len()
             })?;
         };
 
-        Self::flush(tx, tx_buf)?;
+        self.flush()?;
+    }
+
+    pub fn notifier(&self) -> &File {
+        self.tx.full_signal()
+    }
+}
+
+pub struct BufReceiver {
+    rx: IPCReceiver<u8>,
+    spill: Vec<u8>,
+}
+
+impl BufReceiver {
+    pub fn new(rx: IPCReceiver<u8>) -> Self {
+        BufReceiver {
+            rx,
+            spill: Vec::new(),
+        }
     }
 
     #[throws(ShamanError)]
-    pub fn try_recv_with<F, R>(rx: &mut IPCReceiver<u8>, rx_buf: &mut Vec<u8>, mut f: F) -> R
+    pub fn try_recv_with<F, R>(&mut self, mut f: F) -> R
     where
         F: FnMut(&[u8]) -> R,
     {
@@ -82,40 +101,40 @@ impl Duplex {
         let mut remaining = 1;
         while ret.is_none() && remaining != 0 {
             let status = unsafe {
-                match rx_buf.len() {
-                    0 => rx.receive_trusted(|data| {
+                match self.spill.len() {
+                    0 => self.rx.receive_trusted(|data| {
                         if data.len() < SIZE {
-                            rx_buf.extend(data);
+                            self.spill.extend(data);
                             return data.len();
                         }
 
                         let len = usize::from_ne_bytes(data[..SIZE].try_into().unwrap());
                         if data.len() < SIZE + len {
-                            rx_buf.extend(data);
+                            self.spill.extend(data);
                             return data.len();
                         }
                         ret = Some(f(&data[SIZE..SIZE + len]));
 
                         SIZE + len
                     })?,
-                    1..=SIZEM1 => rx.receive_trusted(|data| {
-                        let n = data.len().min(SIZE - rx_buf.len());
-                        rx_buf.extend(&data[..n]);
+                    1..=SIZEM1 => self.rx.receive_trusted(|data| {
+                        let n = data.len().min(SIZE - self.spill.len());
+                        self.spill.extend(&data[..n]);
                         n
                     })?,
                     n => {
-                        let len = usize::from_ne_bytes(rx_buf[..SIZE].try_into().unwrap());
+                        let len = usize::from_ne_bytes(self.spill[..SIZE].try_into().unwrap());
                         let remaining_len = len - (n - SIZE);
-                        let status = rx.receive_trusted(|data| {
+                        let status = self.rx.receive_trusted(|data| {
                             let n = data.len().min(remaining_len);
-                            rx_buf.extend(&data[..n]);
+                            self.spill.extend(&data[..n]);
                             n
                         })?;
 
-                        assert!(rx_buf.len() <= len + SIZE);
-                        if rx_buf.len() == len + SIZE {
-                            ret = Some(f(&rx_buf[SIZE..]));
-                            rx_buf.clear();
+                        assert!(self.spill.len() <= len + SIZE);
+                        if self.spill.len() == len + SIZE {
+                            ret = Some(f(&self.spill[SIZE..]));
+                            self.spill.clear();
                         }
 
                         status
@@ -130,15 +149,11 @@ impl Duplex {
     }
 
     #[throws(ShamanError)]
-    pub fn try_recv(rx: &mut IPCReceiver<u8>, rx_buf: &mut Vec<u8>) -> Vec<u8> {
-        Self::try_recv_with(rx, rx_buf, |data| data.to_vec())?
+    pub fn try_recv(&mut self) -> Vec<u8> {
+        self.try_recv_with(|data| data.to_vec())?
     }
 
-    pub fn send_notifier(&self) -> &File {
-        self.tx.full_signal()
-    }
-
-    pub fn recv_notifier(&self) -> &File {
+    pub fn notifier(&self) -> &File {
         self.rx.empty_signal()
     }
 }

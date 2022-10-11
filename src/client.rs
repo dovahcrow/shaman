@@ -1,5 +1,5 @@
-use crate::duplex::Duplex;
 use crate::{
+    duplex::{BufReceiver, BufSender},
     errors::ShamanError::{self, *},
     SIZE,
 };
@@ -25,7 +25,8 @@ const RX: Token = Token(2);
 
 pub struct ShamanClient {
     stream: UnixStream,
-    duplex: Duplex,
+    tx: BufSender,
+    rx: BufReceiver,
     poll: Poll,
     sendable: bool,
     receivable: bool,
@@ -67,22 +68,26 @@ impl ShamanClient {
         let poll = Poll::new()?;
         let events = Events::with_capacity(128);
         let mut stream = UnixStream::from_std(stream);
+        let tx = BufSender::new(tx);
+        let rx = BufReceiver::new(rx);
+
         poll.registry()
             .register(&mut stream, SOCK, Interest::READABLE)?;
         poll.registry().register(
-            &mut SourceFd(&tx.full_signal().as_raw_fd()),
+            &mut SourceFd(&tx.notifier().as_raw_fd()),
             TX,
             Interest::READABLE,
         )?;
         poll.registry().register(
-            &mut SourceFd(&rx.empty_signal().as_raw_fd()),
+            &mut SourceFd(&rx.notifier().as_raw_fd()),
             RX,
             Interest::READABLE,
         )?;
 
         Self {
             stream,
-            duplex: Duplex::new(tx, rx),
+            tx,
+            rx,
             poll,
             receivable: false,
             sendable: true,
@@ -105,12 +110,12 @@ impl ShamanClient {
                 }
                 TX => {
                     let mut buf = [0; 8];
-                    self.duplex.send_notifier().read(&mut buf)?;
+                    self.tx.notifier().read(&mut buf)?;
                     self.sendable = true;
                 }
                 RX => {
                     let mut buf = [0; 8];
-                    self.duplex.recv_notifier().read(&mut buf)?;
+                    self.rx.notifier().read(&mut buf)?;
                     self.receivable = true;
                 }
                 _ => unreachable!("Unknown Token"),
@@ -125,7 +130,7 @@ impl ShamanClient {
                 self.poll(None)?;
             }
 
-            match Duplex::try_recv(&mut self.duplex.rx, &mut self.duplex.rx_buf) {
+            match self.rx.try_recv() {
                 Ok(v) => break v,
                 Err(WouldBlock) => self.receivable = false,
                 Err(e) => throw!(e),
@@ -146,7 +151,7 @@ impl ShamanClient {
                     self.poll(Some(poll_time))?;
                 }
             }
-            match Duplex::try_recv(&mut self.duplex.rx, &mut self.duplex.rx_buf) {
+            match self.rx.try_recv() {
                 Ok(v) => return v,
                 Err(WouldBlock) => self.receivable = false,
                 Err(e) => throw!(e),
@@ -156,7 +161,7 @@ impl ShamanClient {
 
     #[throws(ShamanError)]
     pub fn try_recv(&mut self) -> Vec<u8> {
-        match Duplex::try_recv(&mut self.duplex.rx, &mut self.duplex.rx_buf) {
+        match self.rx.try_recv() {
             Ok(v) => v,
             Err(WouldBlock) => {
                 self.receivable = false;
@@ -173,7 +178,7 @@ impl ShamanClient {
                 self.poll(None)?;
             }
 
-            match Duplex::try_send(&mut self.duplex.tx, &mut self.duplex.tx_buf, data) {
+            match self.tx.try_send(data) {
                 Ok(_) => break,
                 Err(WouldBlock) => self.sendable = false,
                 Err(e) => throw!(e),
@@ -183,7 +188,7 @@ impl ShamanClient {
 
     #[throws(ShamanError)]
     pub fn try_send(&mut self, data: &[u8]) {
-        match Duplex::try_send(&mut self.duplex.tx, &mut self.duplex.tx_buf, data) {
+        match self.tx.try_send(data) {
             Ok(_) => {}
             Err(WouldBlock) => {
                 self.sendable = false;
@@ -196,12 +201,12 @@ impl ShamanClient {
     /// Get the RawFd to get the notification when the send side is not full.
     /// Useful for the epoll/mio based application
     pub fn send_notifier(&self) -> &File {
-        self.duplex.send_notifier()
+        self.tx.notifier()
     }
 
     /// Get the RawFd to get the notification when the recv side is not empty.
     /// Useful for the epoll/mio based application
     pub fn recv_notifier(&self) -> &File {
-        self.duplex.recv_notifier()
+        self.rx.notifier()
     }
 }
