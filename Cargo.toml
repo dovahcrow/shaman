@@ -5,6 +5,9 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+
 [dependencies]
 fehler = "1"
 libc = "0.2"
@@ -19,7 +22,10 @@ dashmap = "5"
 shmem-ipc = {git = "https://github.com/diwic/shmem-ipc"}
 thiserror = "1"
 
+tokio = {version = "1", optional = true, features = ["time", "net", "macros"]}
+
 [dev-dependencies]
 anyhow = "1"
 bincode = "1"
 env_logger = "0.9"
+tokio = {version = "1", features = ["rt-multi-thread"]}

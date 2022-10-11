@@ -108,16 +108,8 @@ impl ShamanClient {
                     let mut buf = [0; 32];
                     while let Ok(32) = self.stream.read(&mut buf) {}
                 }
-                TX => {
-                    let mut buf = [0; 8];
-                    self.tx.notifier().read(&mut buf)?;
-                    self.sendable = true;
-                }
-                RX => {
-                    let mut buf = [0; 8];
-                    self.rx.notifier().read(&mut buf)?;
-                    self.receivable = true;
-                }
+                TX => self.sendable = true,
+                RX => self.receivable = true,
                 _ => unreachable!("Unknown Token"),
             }
         }

@@ -214,21 +214,12 @@ where
     fn ipc_handler(&mut self, event: &Event) {
         if let Some(conn_id) = self.tx_token_to_connection.get(&event.token()) {
             let mut tx = self.senders.get_mut(conn_id).unwrap();
-
-            // clear the eventfd
-            let mut buf = [0; 8];
-            tx.1.notifier().read_exact(&mut buf)?;
-
             tx.1.flush()?;
             return;
         }
 
         if let Some(conn_id) = self.rx_token_to_connection.get(&event.token()) {
             let (_, ref mut rx) = self.receivers.get_mut(conn_id).unwrap();
-
-            // clear the eventfd
-            let mut buf = [0; 8];
-            rx.notifier().read_exact(&mut buf)?;
 
             loop {
                 let ret = rx.try_recv_with(|data| {
