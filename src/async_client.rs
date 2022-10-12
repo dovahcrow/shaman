@@ -97,9 +97,48 @@ impl ShamanAsyncClient {
         }
     }
 
+    // zero copy
+    #[throws(ShamanError)]
+    pub async fn recv_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        loop {
+            match self.try_recv_with(f) {
+                Ok(v) => break v,
+                Err(WouldBlock) => {
+                    select! {
+                        ready = self.stream.ready(Interest::READABLE) => {
+                            if ready?.is_read_closed() {
+                                throw!(ConnectionClosed)
+                            }
+                        }
+                        guard = self.rx_notifier.readable() => {
+                            guard?.clear_ready();
+                        }
+                    }
+                }
+
+                Err(e) => throw!(e),
+            }
+        }
+    }
+
     #[throws(ShamanError)]
     pub fn try_recv(&mut self) -> Vec<u8> {
         self.rx.try_recv()?
+    }
+
+    // zero copy
+    #[throws(ShamanError)]
+    pub fn try_recv_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        match self.rx.try_recv_with(f) {
+            Ok(v) => v,
+            Err(e) => throw!(e),
+        }
     }
 
     #[throws(ShamanError)]

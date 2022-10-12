@@ -32,6 +32,7 @@ impl BufSender {
         }
     }
 
+    #[inline]
     #[throws(ShamanError)]
     pub fn flush(&mut self) {
         let mut remaining = 1;
@@ -93,7 +94,7 @@ impl BufReceiver {
     }
 
     #[throws(ShamanError)]
-    pub fn try_recv_with<F, R>(&mut self, mut f: F) -> R
+    pub fn try_recv_with<F, R>(&mut self, f: &mut F) -> R
     where
         F: FnMut(&[u8]) -> R,
     {
@@ -150,7 +151,7 @@ impl BufReceiver {
 
     #[throws(ShamanError)]
     pub fn try_recv(&mut self) -> Vec<u8> {
-        self.try_recv_with(|data| data.to_vec())?
+        self.try_recv_with(&mut |data| data.to_vec())?
     }
 
     pub fn notifier(&self) -> &File {

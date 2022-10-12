@@ -222,7 +222,7 @@ where
             let (_, ref mut rx) = self.receivers.get_mut(conn_id).unwrap();
 
             loop {
-                let ret = rx.try_recv_with(|data| {
+                let ret = rx.try_recv_with(&mut |data| {
                     if let Some(mh) = self.message_handler.as_mut() {
                         mh.on_data(conn_id.0, data)
                     }
