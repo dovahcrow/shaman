@@ -144,17 +144,19 @@ impl ShamanClient {
     pub fn recv_timeout(&mut self, d: Duration) -> Vec<u8> {
         let then = Instant::now();
         loop {
-            while !self.receivable {
-                let poll_time = d - then.elapsed();
-                if poll_time < Duration::from_secs(0) {
-                    throw!(WouldBlock)
-                } else {
-                    self.poll(Some(poll_time))?;
-                }
-            }
             match self.rx.try_recv() {
                 Ok(v) => break v,
-                Err(WouldBlock) => self.receivable = false,
+                Err(WouldBlock) => {
+                    self.receivable = false;
+                    while !self.receivable {
+                        let poll_time = d - then.elapsed();
+                        if poll_time < Duration::from_secs(0) {
+                            throw!(WouldBlock)
+                        } else {
+                            self.poll(Some(poll_time))?;
+                        }
+                    }
+                }
                 Err(e) => throw!(e),
             }
         }
