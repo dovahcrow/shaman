@@ -117,20 +117,29 @@ impl ShamanClient {
 
     #[throws(ShamanError)]
     pub fn recv(&mut self) -> Vec<u8> {
-        loop {
-            while !self.receivable {
-                self.poll(None)?;
-            }
+        self.recv_with(&mut |data| data.to_vec())?
+    }
 
-            match self.rx.try_recv() {
+    // zero copy
+    #[throws(ShamanError)]
+    pub fn recv_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        loop {
+            match self.rx.try_recv_with(f) {
                 Ok(v) => break v,
-                Err(WouldBlock) => self.receivable = false,
+                Err(WouldBlock) => {
+                    self.receivable = false;
+                    while !self.receivable {
+                        self.poll(None)?;
+                    }
+                }
                 Err(e) => throw!(e),
             }
         }
     }
 
-    #[allow(unreachable_code)]
     #[throws(ShamanError)]
     pub fn recv_timeout(&mut self, d: Duration) -> Vec<u8> {
         let then = Instant::now();
@@ -144,7 +153,7 @@ impl ShamanClient {
                 }
             }
             match self.rx.try_recv() {
-                Ok(v) => return v,
+                Ok(v) => break v,
                 Err(WouldBlock) => self.receivable = false,
                 Err(e) => throw!(e),
             }
@@ -153,7 +162,16 @@ impl ShamanClient {
 
     #[throws(ShamanError)]
     pub fn try_recv(&mut self) -> Vec<u8> {
-        match self.rx.try_recv() {
+        self.try_recv_with(&mut |data| data.to_vec())?
+    }
+
+    // zero copy
+    #[throws(ShamanError)]
+    pub fn try_recv_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        match self.rx.try_recv_with(f) {
             Ok(v) => v,
             Err(WouldBlock) => {
                 self.receivable = false;
