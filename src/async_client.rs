@@ -135,10 +135,7 @@ impl ShamanAsyncClient {
     where
         F: FnMut(&[u8]) -> R,
     {
-        match self.rx.try_recv_with(f) {
-            Ok(v) => v,
-            Err(e) => throw!(e),
-        }
+        self.rx.try_recv_with(f)?
     }
 
     #[throws(ShamanError)]
