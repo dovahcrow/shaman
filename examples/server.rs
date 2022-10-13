@@ -1,9 +1,9 @@
 use anyhow::Error;
 use fehler::throws;
 use shaman::{ConnId, MessageHandler, ShamanServer, ShamanServerHandle};
-use std::str;
 use std::{
     fs::remove_file,
+    str,
     thread::sleep,
     time::{Duration, Instant},
 };

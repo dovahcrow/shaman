@@ -3,9 +3,9 @@ use crate::{
     SIZE,
 };
 use fehler::{throw, throws};
+use log::trace;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::collections::VecDeque;
-use std::fs::File;
+use std::{collections::VecDeque, fs::File};
 
 const SIZEM1: usize = SIZE - 1;
 
@@ -47,6 +47,17 @@ impl BufSender {
 
     #[throws(ShamanError)]
     pub fn try_send(&mut self, data: &[u8]) {
+        self.try_send_with(&mut |buf, spill, wrote| {
+            write_slice(buf, spill, &data);
+            *wrote = data.len();
+        })?
+    }
+
+    #[throws(ShamanError)]
+    pub fn try_send_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
         // flush the pending data first
         self.flush()?;
 
@@ -55,24 +66,37 @@ impl BufSender {
             throw!(ShamanError::WouldBlock);
         }
 
+        let mut bytes_wrote = 0;
+        let mut ret = None;
         unsafe {
-            self.tx.send_trusted(|mut buf| {
-                let orig_len = buf.len();
+            self.tx.send_trusted(|buf| {
+                let len_data = [0; SIZE];
 
-                let len_data = data.len().to_ne_bytes();
-                let n = write_slice(buf, &len_data);
-                buf = &mut buf[n..];
-                self.spill.extend(&len_data[n..]);
+                let n = write_slice(buf, &mut self.spill, &len_data);
 
-                let n = write_slice(buf, &data);
-                buf = &mut buf[n..];
-                self.spill.extend(&data[n..]);
+                let r = f(&mut buf[n..], &mut self.spill, &mut bytes_wrote);
+                ret = Some(r);
 
-                orig_len - buf.len()
+                let len_data = bytes_wrote.to_ne_bytes();
+                buf[..n].copy_from_slice(&len_data[..n]);
+                for i in n..SIZE {
+                    self.spill[i] = len_data[i];
+                }
+                trace!(
+                    "bytes_wrote: {}, {:?}",
+                    bytes_wrote + SIZE,
+                    &buf[..bytes_wrote]
+                );
+                (bytes_wrote + SIZE).min(buf.len())
             })?;
         };
 
         self.flush()?;
+
+        match ret {
+            Some(r) => r,
+            None => throw!(ShamanError::WouldBlock),
+        }
     }
 
     pub fn notifier(&self) -> &File {
@@ -104,6 +128,7 @@ impl BufReceiver {
             let status = unsafe {
                 match self.spill.len() {
                     0 => self.rx.receive_trusted(|data| {
+                        trace!("bytes_received: {}, {:?}", data.len(), &data);
                         if data.len() < SIZE {
                             self.spill.extend(data);
                             return data.len();
@@ -174,8 +199,11 @@ fn write_vec_deque_and_trunc(buf: &mut [u8], vd: &mut VecDeque<u8>) -> usize {
     n + m
 }
 
-fn write_slice(buf: &mut [u8], slice: &[u8]) -> usize {
+pub fn write_slice(buf: &mut [u8], spill: &mut VecDeque<u8>, slice: &[u8]) -> usize {
     let n = buf.len().min(slice.len());
     buf[..n].copy_from_slice(&slice[..n]);
+    if n < slice.len() {
+        spill.extend(&slice[n..]);
+    }
     n
 }

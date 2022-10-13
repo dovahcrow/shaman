@@ -8,14 +8,17 @@ use dashmap::DashMap;
 use fehler::{throw, throws};
 use log::{error, info};
 use mio::{
-    event::Event, net::UnixListener, net::UnixStream, unix::SourceFd, Events, Interest, Poll, Token,
+    event::Event,
+    net::{UnixListener, UnixStream},
+    unix::SourceFd,
+    Events, Interest, Poll, Token,
 };
 use sendfd::SendWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::io::Read;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::remove_file,
+    io::Read,
     mem::forget,
     os::unix::io::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
@@ -67,6 +70,21 @@ impl ShamanServerHandle {
             .ok_or(ConnectionNotFound(conn_id))?;
 
         tx.1.try_send(data)?;
+    }
+
+    /// f will be called if the channel has enough space.
+    /// f should first write to the `&mut [u8]`. If full, write the rest to
+    /// `&mut VecDeque<u8>`. Set total bytes wrote in `&mut usize`.
+    #[throws(ShamanError)]
+    pub fn try_send_with<F, R>(&self, conn_id: ConnId, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
+        let mut tx = self
+            .senders
+            .get_mut(&Token(conn_id))
+            .ok_or(ConnectionNotFound(conn_id))?;
+        tx.1.try_send_with(f)?
     }
 
     #[throws(ShamanError)]

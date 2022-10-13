@@ -6,10 +6,12 @@ use crate::{
 use fehler::{throw, throws};
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::os::unix::prelude::AsRawFd;
 use std::{
     fs::File,
-    os::unix::{io::FromRawFd, prelude::RawFd},
+    os::unix::{
+        io::FromRawFd,
+        prelude::{AsRawFd, RawFd},
+    },
     path::Path,
 };
 use tokio::{

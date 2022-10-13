@@ -4,19 +4,19 @@ use crate::{
     SIZE,
 };
 use fehler::{throw, throws};
-use mio::net::UnixStream;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
+use mio::{net::UnixStream, unix::SourceFd, Events, Interest, Poll, Token};
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
-use std::io::Read;
-use std::io::Write;
-use std::os::unix::prelude::AsRawFd;
-use std::time::{Duration, Instant};
 use std::{
+    collections::VecDeque,
     fs::File,
-    os::unix::{io::FromRawFd, prelude::RawFd},
+    io::{Read, Write},
+    os::unix::{
+        io::FromRawFd,
+        prelude::{AsRawFd, RawFd},
+    },
     path::Path,
+    time::{Duration, Instant},
 };
 
 const SOCK: Token = Token(0);
@@ -202,6 +202,42 @@ impl ShamanClient {
     pub fn try_send(&mut self, data: &[u8]) {
         match self.tx.try_send(data) {
             Ok(_) => {}
+            Err(WouldBlock) => {
+                self.sendable = false;
+                throw!(WouldBlock);
+            }
+            Err(e) => throw!(e),
+        }
+    }
+
+    #[throws(ShamanError)]
+    pub fn send_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
+        loop {
+            while !self.sendable {
+                self.poll(None)?;
+            }
+
+            match self.tx.try_send_with(f) {
+                Ok(r) => break r,
+                Err(WouldBlock) => self.sendable = false,
+                Err(e) => throw!(e),
+            }
+        }
+    }
+
+    /// f will be called if the channel has enough space.
+    /// f should first write to the `&mut [u8]`. If full, write the rest to
+    /// `&mut VecDeque<u8>`. Set total bytes wrote in `&mut usize`.
+    #[throws(ShamanError)]
+    pub fn try_send_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
+        match self.tx.try_send_with(f) {
+            Ok(r) => r,
             Err(WouldBlock) => {
                 self.sendable = false;
                 throw!(WouldBlock);
