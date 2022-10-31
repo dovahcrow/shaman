@@ -197,9 +197,13 @@ where
                 .poll(&mut events, Some(Duration::from_millis(100)))?;
 
             for event in events.iter() {
-                match event.token() {
-                    SERVER => self.incoming_handler()?,
-                    _ => self.ipc_handler(event)?,
+                let result = match event.token() {
+                    SERVER => self.incoming_handler(),
+                    _ => self.ipc_handler(event),
+                };
+
+                if let Err(e) = result {
+                    error!("ShamanLoop errored with: {}", e);
                 }
             }
         }
