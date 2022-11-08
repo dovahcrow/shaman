@@ -9,6 +9,7 @@ version = "0.1.0"
 default = []
 
 [dependencies]
+dashmap = "5"
 fehler = "1"
 libc = "0.2"
 log = "0.4"
@@ -17,9 +18,8 @@ mio-misc = "2"
 parking_lot = "0.12"
 sendfd = "0.4"
 serde = {version = "1", features = ["derive"]}
-# shmem-ipc = "0.2"
-dashmap = "5"
-shmem-ipc = {git = "https://github.com/diwic/shmem-ipc"}
+shmem-ipc = {git = "https://github.com/dovahcrow/shmem-ipc"}
+# shmem-ipc = {path = "../shmem-ipc"}
 thiserror = "1"
 
 tokio = {version = "1", optional = true, features = ["time", "net", "macros"]}

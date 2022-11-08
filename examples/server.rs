@@ -1,6 +1,7 @@
 use anyhow::Error;
 use fehler::throws;
 use shaman::{ConnId, MessageHandler, ShamanServer, ShamanServerHandle};
+use shmem_ipc::mem::mfd::HugetlbSize;
 use std::{
     fs::remove_file,
     str,
@@ -27,7 +28,8 @@ fn main() {
     let mut server = ShamanServer::new("/tmp/shaman.sock")?;
     let handler = Handler { h: server.handle() };
     server.set_message_handler(handler);
-
+    server.use_hugetlb(HugetlbSize::Huge2MB);
+    server.use_mlock(true);
     let serverhandle = server.handle();
 
     server.spawn();

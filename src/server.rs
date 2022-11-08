@@ -14,7 +14,11 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use sendfd::SendWithFd;
-use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
+use shmem_ipc::{
+    mem::mfd::HugetlbSize,
+    sharedring::{Receiver as IPCReceiver, Sender as IPCSender},
+};
+use std::io::Write;
 use std::{
     collections::{HashMap, VecDeque},
     fs::remove_file,
@@ -106,6 +110,8 @@ impl ShamanServerHandle {
 
 pub struct ShamanServer<H> {
     socket_path: PathBuf,
+    hugetlb: Option<HugetlbSize>,
+    mlock: bool,
 
     socket_listener: UnixListener,
     streams: HashMap<Token, UnixStream>, // connection id -> stream
@@ -151,6 +157,9 @@ impl<H> ShamanServer<H> {
 
         Self {
             socket_path: path.to_owned(),
+            hugetlb: None,
+            mlock: false,
+
             socket_listener: listener,
 
             streams: HashMap::new(),
@@ -185,6 +194,14 @@ where
 {
     pub fn set_message_handler(&mut self, message_handler: H) {
         self.message_handler = Some(message_handler)
+    }
+
+    pub fn use_hugetlb(&mut self, tlbsize: HugetlbSize) {
+        self.hugetlb = Some(tlbsize)
+    }
+
+    pub fn use_mlock(&mut self, mlock: bool) {
+        self.mlock = mlock;
     }
 
     #[allow(unreachable_code)]
@@ -309,21 +326,41 @@ where
 
             let capacity = usize::from_ne_bytes(capacity);
 
-            let rx = match IPCReceiver::new(capacity) {
+            let maybe_rx = if let Some(tlbsize) = self.hugetlb {
+                IPCReceiver::with_hugetlb(capacity, tlbsize)
+            } else {
+                IPCReceiver::new(capacity)
+            };
+
+            let mut rx = match maybe_rx {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Cannot create receiver: {}", e);
+                    let _ = stream.write(b"\xff");
                     return;
                 }
             };
+            if self.mlock {
+                rx.mlock()?;
+            }
 
-            let tx = match IPCSender::new(capacity) {
+            let maybe_tx = if let Some(tlbsize) = self.hugetlb {
+                IPCSender::with_hugetlb(capacity, tlbsize)
+            } else {
+                IPCSender::new(capacity)
+            };
+
+            let mut tx = match maybe_tx {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Cannot create sender: {}", e);
+                    let _ = stream.write(b"\xff");
                     return;
                 }
             };
+            if self.mlock {
+                tx.mlock()?;
+            }
 
             let fds = &[
                 rx.memfd().as_file().as_raw_fd(),

@@ -45,8 +45,10 @@ impl ShamanClient {
 
         let mut len = [0; SIZE];
         let mut fds: [RawFd; 6] = [-1; 6];
-        stream.recv_with_fd(&mut len, &mut fds)?;
-
+        let (nbytes, nfds) = stream.recv_with_fd(&mut len, &mut fds)?;
+        if nbytes != 8 || nfds != 6 {
+            throw!(ShamanError::HandshakeFailed)
+        }
         let len = usize::from_ne_bytes(len);
         let tx = unsafe {
             IPCSender::open(

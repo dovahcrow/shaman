@@ -8,6 +8,9 @@ pub enum ShamanError {
     #[error("Would block")]
     WouldBlock,
 
+    #[error("Failed to handshake with the server")]
+    HandshakeFailed,
+
     #[error("Connection {0} not found")]
     ConnectionNotFound(usize),
 

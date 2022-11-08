@@ -7,6 +7,7 @@ use fehler::{throw, throws};
 use sendfd::RecvWithFd;
 use shmem_ipc::sharedring::{Receiver as IPCReceiver, Sender as IPCSender};
 use std::{
+    collections::VecDeque,
     fs::File,
     os::unix::{
         io::FromRawFd,
@@ -165,5 +166,41 @@ impl ShamanAsyncClient {
     #[throws(ShamanError)]
     pub fn try_send(&mut self, data: &[u8]) {
         self.tx.try_send(data)?
+    }
+
+    #[throws(ShamanError)]
+    pub async fn send_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
+        loop {
+            match self.try_send_with(f) {
+                Ok(v) => break v,
+                Err(WouldBlock) => {
+                    select! {
+                        ready = self.stream.ready(Interest::READABLE) => {
+                            if ready?.is_read_closed() {
+                                throw!(ConnectionClosed)
+                            }
+                        }
+                        guard = self.tx_notifier.readable() => {
+                            guard?.clear_ready();
+                        }
+                    }
+                }
+                Err(e) => throw!(e),
+            }
+        }
+    }
+
+    /// f will be called if the channel has enough space.
+    /// f should first write to the `&mut [u8]`. If full, write the rest to
+    /// `&mut VecDeque<u8>`. Set total bytes wrote in `&mut usize`.
+    #[throws(ShamanError)]
+    pub fn try_send_with<F, R>(&mut self, f: &mut F) -> R
+    where
+        F: FnMut(&mut [u8], &mut VecDeque<u8>, &mut usize) -> R,
+    {
+        self.tx.try_send_with(f)?
     }
 }
