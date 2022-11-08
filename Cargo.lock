@@ -425,7 +425,7 @@ dependencies = [
 [[package]]
 name = "shmem-ipc"
 version = "0.2.0"
-source = "git+https://github.com/dovahcrow/shmem-ipc#ea76ea887f593e6149fa75d20cf5c5987783ef09"
+source = "git+https://github.com/dovahcrow/shmem-ipc?rev=ea76ea88#ea76ea887f593e6149fa75d20cf5c5987783ef09"
 dependencies = [
  "byteorder",
  "libc",

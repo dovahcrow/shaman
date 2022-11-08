@@ -18,7 +18,7 @@ mio-misc = "2"
 parking_lot = "0.12"
 sendfd = "0.4"
 serde = {version = "1", features = ["derive"]}
-shmem-ipc = {git = "https://github.com/dovahcrow/shmem-ipc"}
+shmem-ipc = {git = "https://github.com/dovahcrow/shmem-ipc", rev = "ea76ea88"}
 # shmem-ipc = {path = "../shmem-ipc"}
 thiserror = "1"
 
